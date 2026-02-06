@@ -628,7 +628,8 @@ def _broadcast_room_event_locally(room, event, username, origin_host, payload=No
         text = format_room_event_text(MY_SERVER_HOST, event, username, origin_host, payload)
         target_key = room_key or room
         message_type = 'room_event' if event in ['message', 'act'] else 'system'
-        broadcast_message(text, target_key, message_type=message_type)
+        sender = f"{username}@{origin_host}" if (origin_host and origin_host != MY_SERVER_HOST) else username
+        broadcast_message(text, target_key, message_type=message_type, sender=sender)
     except Exception:
         pass
 
@@ -662,7 +663,7 @@ class Session:
     def send_text(self, message, message_type='system'):
         return enqueue_send(self.client_socket, message, None, message_type)
     
-def broadcast_message(message, server_name, sender_session=None, message_type='broadcast_message'):
+def broadcast_message(message, server_name, sender_session=None, message_type='broadcast_message', sender=None):
     try:
         with session_lock:
             sessions = list(clients_by_server.get(server_name, set()))
@@ -670,7 +671,9 @@ def broadcast_message(message, server_name, sender_session=None, message_type='b
         for sess in sessions:
             if sender_session is not None and sess is sender_session:
                 continue
-            
+            if sender and getattr(sess, 'username', None) and capabilities_manager.should_filter_message(sess.username, sender, 'server'):
+                continue
+
             client_key = get_client_encryption_key(sess)
             if client_key:
                 send_to_client(sess.client_socket, message, client_key, message_type)
@@ -681,6 +684,8 @@ def broadcast_message(message, server_name, sender_session=None, message_type='b
 
 
 def send_private_message(sender_username, recipient_username, message):
+    if capabilities_manager.should_filter_message(recipient_username, sender_username, 'pm'):
+        return True
     delivered_any = False
     with session_lock:
         recipient_sessions = list(clients_by_user.get(recipient_username, set()))
@@ -743,6 +748,13 @@ def _send_remote_private_message_sync(sender, recipient, host, message):
  
 
 def deliver_remote_pm(sender, recipient, message, server_host=None, from_host=None):
+    filter_sender = sender
+    if from_host and from_host != MY_SERVER_HOST:
+        filter_sender = f"{sender}@{from_host}"
+    elif server_host and server_host != MY_SERVER_HOST:
+        filter_sender = f"{sender}@{server_host}"
+    if capabilities_manager.should_filter_message(recipient, filter_sender, 'pm'):
+        return True
     sender_display = sender
     if from_host and from_host != MY_SERVER_HOST:
         sender_display = f"{sender}@{from_host}"
@@ -1170,7 +1182,7 @@ def handle_client(client_socket, client_address):
                                         servers[local_room] = members
                                         save_server(local_room, members)
                                 if should_broadcast_join:
-                                    broadcast_message(f"*** {logged_in_user} has joined the server.", user_server)
+                                    broadcast_message(f"*** {logged_in_user} has joined the server.", user_server, sender=logged_in_user)
                                     try:
                                         threading.Thread(target=_send_room_event_to_remotes, args=(local_room, 'joined', logged_in_user, MY_SERVER_HOST, None), daemon=True).start()
                                     except Exception:
@@ -1281,7 +1293,7 @@ def handle_client(client_socket, client_address):
                         }
                         send_remote_room_message(host_part, room_name, payload)
                     else:
-                        broadcast_message(f"*** {logged_in_user} {act_name}", user_server, message_type='action_message')
+                        broadcast_message(f"*** {logged_in_user} {act_name}", user_server, message_type='action_message', sender=logged_in_user)
                         try:
                             threading.Thread(target=_send_room_event_to_remotes, args=(room_name, 'act', logged_in_user, MY_SERVER_HOST, {'act': act_name}), daemon=True).start()
                         except Exception:
@@ -1302,7 +1314,6 @@ def handle_client(client_socket, client_address):
                             continue
                     if recipient not in users:
                         send_to_client(client_socket, "User does not exist.", client_key)
-                        # Удаляем получателя со всех локальных серверов при ошибке
                         _kick_user(recipient)
                         continue
                     if recipient == logged_in_user:
@@ -1314,7 +1325,6 @@ def handle_client(client_socket, client_address):
 
                     result = send_private_message(logged_in_user, recipient, private_message)
                     if not result:
-                        # Удаляем получателя со всех локальных серверов при ошибке отправки
                         _kick_user(recipient)
                     notify_tcp_result(client_socket, result, recipient, client_key)
                 elif message.startswith("/help"):
@@ -1369,7 +1379,7 @@ def handle_client(client_socket, client_address):
                         send_remote_room_message(host_part, room_name, payload)
                     else:
                         full_message = f"{logged_in_user}: {message}"
-                        broadcast_message(full_message, user_server, message_type='chat_message')
+                        broadcast_message(full_message, user_server, message_type='chat_message', sender=logged_in_user)
                         _send_room_event_to_remotes(room_name, 'message', logged_in_user, MY_SERVER_HOST, {'text': message})
     except Exception as e:
         log_message(f"TCP client {client_address} error: {e}.")
@@ -1449,7 +1459,7 @@ def handle_client(client_socket, client_address):
                 pass
             if left_broadcast_needed:
                 u, srv = left_broadcast_needed
-                broadcast_message(f"*** {u} has left the server.", srv)
+                broadcast_message(f"*** {u} has left the server.", srv, sender=u)
         log_message(f"TCP client {client_address} disconnected.")
 
 
@@ -1540,7 +1550,7 @@ def _kick_user(username):
                     last = _authoritative_room_remove_member(server_name, username, origin_host)
                     
                     if last:
-                        broadcast_message(f"*** {username} has left the server.", server_name)
+                        broadcast_message(f"*** {username} has left the server.", server_name, sender=username)
 
                         members = servers.get(server_name, [])
                         
@@ -1580,7 +1590,7 @@ def cleanup_OU():
             for username, origin_host in users_to_remove:
                 last = _authoritative_room_remove_member(server_name, username, origin_host)
                 if last:
-                    broadcast_message(f"*** {username} has left the server.", server_name)
+                    broadcast_message(f"*** {username} has left the server.", server_name, sender=username)
 
                     if '@' not in server_name:
                         members = servers.get(server_name, [])

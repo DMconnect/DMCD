@@ -27,7 +27,8 @@ class Capability:
 class CapabilitiesManager:
     def __init__(self):
         self.capabilities = {}
-        self._raw_connection_handlers = [] 
+        self._raw_connection_handlers = []
+        self._message_filters = []
         self._load_capabilities()
     
     def _load_capabilities(self):
@@ -62,6 +63,26 @@ class CapabilitiesManager:
                 self._raw_connection_handlers.append(capability)
             except Exception:
                 pass
+        if hasattr(capability, 'register_filters'):
+            try:
+                capability.register_filters(self)
+            except Exception:
+                pass
+
+    def register_message_filter(self, filter_fn):
+        if filter_fn not in self._message_filters:
+            self._message_filters.append(filter_fn)
+
+    def should_filter_message(self, recipient_username, sender_username, context):
+        if not recipient_username or not sender_username:
+            return False
+        for f in self._message_filters:
+            try:
+                if f(recipient_username, sender_username, context):
+                    return True
+            except Exception:
+                continue
+        return False
     
     def get_capability(self, name):
         return self.capabilities.get(name)
