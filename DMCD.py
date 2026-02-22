@@ -103,6 +103,8 @@ _send_queues = {}
 _send_workers = {}
 _send_state_lock = threading.RLock()
 
+_last_jl = {}
+
 DELAYED_MESSAGE_TYPES = {
     'chat_message',
     'private_message',
@@ -665,15 +667,19 @@ class Session:
     
 def broadcast_message(message, server_name, sender_session=None, message_type='broadcast_message', sender=None):
     try:
+        m = re.match(r'\*\*\* (.+) has (joined|left) the server\.', message)
+        jl = m.groups() if m else None
         with session_lock:
             sessions = list(clients_by_server.get(server_name, set()))
-
         for sess in sessions:
-            if sender_session is not None and sess is sender_session:
+            if sender_session and sess is sender_session:
                 continue
             if sender and getattr(sess, 'username', None) and capabilities_manager.should_filter_message(sess.username, sender, 'server'):
                 continue
-
+            if jl and _last_jl.get(id(sess)) == jl:
+                continue
+            if jl:
+                _last_jl[id(sess)] = jl
             client_key = get_client_encryption_key(sess)
             if client_key:
                 send_to_client(sess.client_socket, message, client_key, message_type)
