@@ -5,7 +5,7 @@ import time
 import os
 import re
 import hashlib
-import base64
+import base64f
 import random
 import struct
 import queue
@@ -704,7 +704,6 @@ def get_safe_server_path(server_name):
     return safe_name
 
 def is_ping(text):
-    """True, если строка состоит только из одного или нескольких '/'."""
     return bool(text) and all(ch == '/' for ch in text)
 
 def get_client_encryption_key(session):
