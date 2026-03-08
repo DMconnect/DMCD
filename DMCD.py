@@ -703,6 +703,10 @@ def get_safe_server_path(server_name):
     safe_name = os.path.basename(server_name)
     return safe_name
 
+def is_ping(text):
+    """True, если строка состоит только из одного или нескольких '/'."""
+    return bool(text) and all(ch == '/' for ch in text)
+
 def get_client_encryption_key(session):
     if not hasattr(session, 'client_socket') or not session.client_socket:
         return None
@@ -1029,7 +1033,7 @@ def handle_client(client_socket, client_address):
         client_socket.settimeout(None)
 
         while not logged_in_user:
-            if not last_cmd == "/":
+            if not is_ping(last_cmd):
                 send_to_client(client_socket, "Enter command (/login /register): ", client_key)
             else:
                 send_to_client(client_socket, "*Ping!*", client_key)
@@ -1040,7 +1044,7 @@ def handle_client(client_socket, client_address):
 
             last_cmd = command
 
-            if not command == "/":
+            if not is_ping(command):
                 log_message(f"TCP {client_address} message: {command}.")
 
             if command.startswith("/register"):
@@ -1092,7 +1096,7 @@ def handle_client(client_socket, client_address):
             if not message:
                 break
 
-            if not message == "/":
+            if not is_ping(message):
                 log_message(f"TCP {client_address} message: {message}")
 
             if message.startswith("/"):
@@ -1337,7 +1341,7 @@ def handle_client(client_socket, client_address):
                     else:
                         caps_text = "No capabilities available."
                     send_to_client(client_socket, caps_text, client_key)
-                elif message.startswith("/") and message != "/" and not any(message.startswith(cmd) for cmd in ["/login", "/register", "/create_server", "/join_server", "/list_servers", "/members", "/pm", "/act", "/help", "/list_capabilities", "/ban", "/delete_server"]):
+                elif message.startswith("/") and not is_ping(message) and not any(message.startswith(cmd) for cmd in ["/login", "/register", "/create_server", "/join_server", "/list_servers", "/members", "/pm", "/act", "/help", "/list_capabilities", "/ban", "/delete_server"]):
                     cap_command = message[1:]
                     parts = cap_command.split()
                     if len(parts) > 1:
@@ -1361,7 +1365,7 @@ def handle_client(client_socket, client_address):
                         pass
                     else:
                         send_to_client(client_socket, "Unknown command.", client_key)
-                elif message == "/":
+                elif is_ping(message):
                     send_to_client(client_socket, "*Ping!*", client_key)
                 else:
                     send_to_client(client_socket, "Unknown command.", client_key)
