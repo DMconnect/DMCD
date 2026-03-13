@@ -5,7 +5,7 @@ import time
 import os
 import re
 import hashlib
-import base64f
+import base64
 import random
 import struct
 import queue
@@ -92,6 +92,7 @@ client_keys = {}
 members_by_room = {}
 remote_subscribers_by_room = {}
 user_remote_counters = {}
+s2s_links = {}
 
 dialback_cache = {}
 pending_dialback = {}
@@ -114,6 +115,7 @@ DELAYED_MESSAGE_TYPES = {
 DIALBACK_CACHE_TTL = 3600
 MAX_RETRIES = 2
 RETRY_DELAY = 1
+S2S_TTL = 300
 
 default_server = 'general'
 
@@ -850,6 +852,10 @@ def handle_client(client_socket, client_address):
                         data = client_socket.recv(MAX_PACKET_SIZE)
                         msg = json.loads(data.decode('utf-8').strip())
                         from_host = msg.get('from_host')
+                        try:
+                            s2s_links[from_host] = time.time()
+                        except Exception:
+                            pass
                         msg_id = msg.get('msg_id')
                         client_addr = client_address[0]
                         pending_dialback[msg_id] = (msg.get('sender'), msg.get('recipient'), msg.get('message'), client_socket)
@@ -905,6 +911,10 @@ def handle_client(client_socket, client_address):
                         msg = json.loads(data.decode('utf-8').strip())
                         msg_type = msg.get('type')
                         from_host = msg.get('from_host')
+                        try:
+                            s2s_links[from_host] = time.time()
+                        except Exception:
+                            pass
                         msg_id = msg.get('msg_id')
                         room = msg.get('room')
                         
@@ -1044,7 +1054,7 @@ def handle_client(client_socket, client_address):
             last_cmd = command
 
             if not is_ping(command):
-                log_message(f"TCP {client_address} message: {command}.")
+                log_message(f"TCP {client_address} message: {command}")
 
             if command.startswith("/register"):
                 parts = command.split(" ", 2)
@@ -1566,6 +1576,8 @@ def cleanup_OU():
             for server_name, sessions in clients_by_server.items():
                 active_users_by_server[server_name] = {sess.username for sess in sessions if sess.username}
 
+        now = time.time()
+
         for server_name in list(servers.keys()):
             room_map = _room_members(server_name)
             users_to_remove = []
@@ -1577,21 +1589,19 @@ def cleanup_OU():
                     if username not in active_users_on_server:
                         users_to_remove.append((username, origin_host))
                 else:
-                    subs = _remote_subscribers(server_name)
-                    if origin_host not in subs:
-                        users_to_remove.append((username, origin_host))
+                    pass
 
             for username, origin_host in users_to_remove:
                 last = _authoritative_room_remove_member(server_name, username, origin_host)
-                if last:
+                if origin_host != MY_SERVER_HOST and last:
                     broadcast_message(f"*** {username} has left the server.", server_name, sender=username)
 
-                    if '@' not in server_name:
-                        members = servers.get(server_name, [])
-                        if username in members:
-                            members.remove(username)
-                            servers[server_name] = members
-                            save_server(server_name, members)
+                if '@' not in server_name and origin_host == MY_SERVER_HOST:
+                    members = servers.get(server_name, [])
+                    if username in members:
+                        members.remove(username)
+                        servers[server_name] = members
+                        save_server(server_name, members)
 
     except Exception as e:
         log_message(f"Error: {e}.")
@@ -1600,12 +1610,34 @@ def cleanup_tasks():
     while True:
         time.sleep(60)
         current_time = time.time()
+
         to_remove = []
         for key, (timestamp, result) in dialback_cache.items():
             if current_time - timestamp > DIALBACK_CACHE_TTL:
                 to_remove.append(key)
         for key in to_remove:
             del dialback_cache[key]
+
+        stale_hosts = []
+        for host, last_ts in list(s2s_links.items()):
+            if current_time - last_ts > S2S_TTL:
+                stale_hosts.append(host)
+        for host in stale_hosts:
+            try:
+                for server_name in list(servers.keys()):
+                    room_map = _room_members(server_name)
+                    for (username, origin_host) in list(room_map.keys()):
+                        if origin_host == host:
+                            last = _authoritative_room_remove_member(server_name, username, origin_host)
+                            if last:
+                                try:
+                                    text = format_room_event_text(MY_SERVER_HOST, 'left', username, origin_host)
+                                except Exception:
+                                    text = f"*** {username}@{origin_host} has left the server."
+                                broadcast_message(text, server_name, sender=username)
+                del s2s_links[host]
+            except Exception as e:
+                log_message(f"Error {host}: {e}.")
 
         cleanup_OU()
 
