@@ -92,7 +92,6 @@ client_keys = {}
 members_by_room = {}
 remote_subscribers_by_room = {}
 user_remote_counters = {}
-s2s_links = {}
 
 dialback_cache = {}
 pending_dialback = {}
@@ -115,7 +114,7 @@ DELAYED_MESSAGE_TYPES = {
 DIALBACK_CACHE_TTL = 3600
 MAX_RETRIES = 2
 RETRY_DELAY = 1
-S2S_TTL = 300
+S2S_PING_TIMEOUT = 8
 
 default_server = 'general'
 
@@ -477,6 +476,10 @@ def _room_members(room):
 def _remote_subscribers(room):
     return remote_subscribers_by_room.setdefault(room, set())
 
+def _remote_member_exists(room, username, origin_host):
+    room_map = _room_members(room)
+    return (username, origin_host) in room_map
+
 def parse_room_and_host(name):
     if '@' in name:
         idx = name.rfind('@')
@@ -624,6 +627,34 @@ def send_remote_room_message(host, room, payload):
         **payload
     }
     return _send_remote_room_sync(host, 42439, data)
+
+def _s2s_ping(host):
+    try:
+        with socket.create_connection((host, 42439), timeout=S2S_PING_TIMEOUT) as s:
+            s.sendall((json.dumps({'type': 's2s_ping', 'from_host': get_advertised_host()}) + '\n').encode('utf-8'))
+            s.settimeout(S2S_PING_TIMEOUT)
+            resp = b''
+            while not resp.endswith(b'\n'):
+                chunk = s.recv(MAX_PACKET_SIZE)
+                if not chunk:
+                    return False
+                resp += chunk
+            out = json.loads(resp.decode('utf-8', errors='replace').strip())
+            return out.get('status') == 'ok'
+    except Exception:
+        return False
+
+def _kick_remote_host(host):
+    for server_name in list(servers.keys()):
+        room_map = _room_members(server_name)
+        for (username, origin_host) in list(room_map.keys()):
+            if origin_host != host:
+                continue
+            last = _authoritative_room_remove_member(server_name, username, origin_host)
+            if last:
+                text = format_room_event_text(MY_SERVER_HOST, 'left', username, origin_host)
+                broadcast_message(text, server_name, sender=username)
+            _update_remote_subscriber_count(server_name, host)
 
 def _broadcast_room_event_locally(room, event, username, origin_host, payload=None, room_key=None):
     try:
@@ -806,9 +837,11 @@ def handle_remote_pm_tcp(sender, recipient, host, private_message, client_socket
             except Exception:
                 pass
                 
-            _kick_user(recipient)
+            _kick_user(recipient_display)
             return
     notify_tcp_result(client_socket, status, recipient_display, client_key)
+    if not status:
+        _kick_user(recipient_display)
 
 def send_to_client(client_socket, message, client_key=None, message_type='system'):
     return enqueue_send(client_socket, message, client_key, message_type)
@@ -852,10 +885,6 @@ def handle_client(client_socket, client_address):
                         data = client_socket.recv(MAX_PACKET_SIZE)
                         msg = json.loads(data.decode('utf-8').strip())
                         from_host = msg.get('from_host')
-                        try:
-                            s2s_links[from_host] = time.time()
-                        except Exception:
-                            pass
                         msg_id = msg.get('msg_id')
                         client_addr = client_address[0]
                         pending_dialback[msg_id] = (msg.get('sender'), msg.get('recipient'), msg.get('message'), client_socket)
@@ -906,15 +935,22 @@ def handle_client(client_socket, client_address):
                         client_socket.send((json.dumps(resp) + '\n').encode('utf-8'))
                         client_socket.close()
                         return
+                    elif msg.get('type') == 's2s_ping':
+                        data = client_socket.recv(MAX_PACKET_SIZE)
+                        try:
+                            client_socket.send((json.dumps({'status': 'ok'}) + '\n').encode('utf-8'))
+                        except Exception:
+                            pass
+                        try:
+                            client_socket.close()
+                        except Exception:
+                            pass
+                        return
                     elif msg.get('type') in ('room_join','room_leave','room_message','room_act','room_members_request','room_event'):
                         data = client_socket.recv(MAX_PACKET_SIZE)
                         msg = json.loads(data.decode('utf-8').strip())
                         msg_type = msg.get('type')
                         from_host = msg.get('from_host')
-                        try:
-                            s2s_links[from_host] = time.time()
-                        except Exception:
-                            pass
                         msg_id = msg.get('msg_id')
                         room = msg.get('room')
                         
@@ -985,6 +1021,10 @@ def handle_client(client_socket, client_address):
                                 elif msg_type == 'room_leave':
                                     sender = msg.get('sender')
                                     origin_host = from_host
+                                    if not _remote_member_exists(room, sender, origin_host):
+                                        client_socket.send((json.dumps({'status':'error','reason':'not_in_room'}) + '\n').encode('utf-8'))
+                                        client_socket.close()
+                                        return
                                     last = _authoritative_room_remove_member(room, sender, origin_host)
                                     _update_remote_subscriber_count(room, origin_host)
                                     if last:
@@ -1000,6 +1040,10 @@ def handle_client(client_socket, client_address):
                                 elif msg_type == 'room_message':
                                     sender = msg.get('sender')
                                     origin_host = from_host
+                                    if not _remote_member_exists(room, sender, origin_host):
+                                        client_socket.send((json.dumps({'status':'error','reason':'not_in_room'}) + '\n').encode('utf-8'))
+                                        client_socket.close()
+                                        return
                                     payload = msg.get('payload') or {}
                                     _broadcast_room_event_locally(room, 'message', sender, origin_host, payload)
                                     
@@ -1015,6 +1059,10 @@ def handle_client(client_socket, client_address):
                                 elif msg_type == 'room_act':
                                     sender = msg.get('sender')
                                     origin_host = from_host
+                                    if not _remote_member_exists(room, sender, origin_host):
+                                        client_socket.send((json.dumps({'status':'error','reason':'not_in_room'}) + '\n').encode('utf-8'))
+                                        client_socket.close()
+                                        return
                                     payload = msg.get('payload') or {}
                                     _broadcast_room_event_locally(room, 'act', sender, origin_host, payload)
                                     try:
@@ -1548,23 +1596,38 @@ def _send_remote_room_sync(target_host, target_port, data):
     
     return send_with_retry(_send_room_msg)
 
-def _kick_user(username):
+def _kick_user(identifier):
     try:
-        for server_name in list(servers.keys()):
-            if '@' in server_name:
-                continue
+        if '@' in identifier:
+            username, host = identifier.rsplit('@', 1)
+        else:
+            username, host = identifier, None
 
+        for server_name in list(servers.keys()):
             room_map = _room_members(server_name)
             for (user, origin_host) in list(room_map.keys()):
-                if user == username and origin_host == MY_SERVER_HOST:
-                    _authoritative_room_remove_member(server_name, username, origin_host)
+                if user != username:
+                    continue
+                if host is not None and origin_host != host:
+                    continue
 
+                last = _authoritative_room_remove_member(server_name, user, origin_host)
+
+                if origin_host == MY_SERVER_HOST and '@' not in server_name:
                     members = servers.get(server_name, [])
-                    if username in members:
-                        members.remove(username)
+                    if user in members:
+                        members.remove(user)
                         servers[server_name] = members
                         save_server(server_name, members)
-                    break
+
+                if origin_host != MY_SERVER_HOST and last:
+                    try:
+                        text = format_room_event_text(MY_SERVER_HOST, 'left', user, origin_host)
+                    except Exception:
+                        text = f"*** {user}@{origin_host} has left the server."
+                    broadcast_message(text, server_name, sender=user)
+
+                break
 
     except Exception as e:
         log_message(f"Error: {e}.")
@@ -1589,12 +1652,15 @@ def cleanup_OU():
                     if username not in active_users_on_server:
                         users_to_remove.append((username, origin_host))
                 else:
-                    pass
+                    subs = _remote_subscribers(server_name)
+                    if origin_host not in subs:
+                        users_to_remove.append((username, origin_host))
 
             for username, origin_host in users_to_remove:
                 last = _authoritative_room_remove_member(server_name, username, origin_host)
                 if origin_host != MY_SERVER_HOST and last:
-                    broadcast_message(f"*** {username} has left the server.", server_name, sender=username)
+                    text = format_room_event_text(MY_SERVER_HOST, 'left', username, origin_host)
+                    broadcast_message(text, server_name, sender=username)
 
                 if '@' not in server_name and origin_host == MY_SERVER_HOST:
                     members = servers.get(server_name, [])
@@ -1618,26 +1684,14 @@ def cleanup_tasks():
         for key in to_remove:
             del dialback_cache[key]
 
-        stale_hosts = []
-        for host, last_ts in list(s2s_links.items()):
-            if current_time - last_ts > S2S_TTL:
-                stale_hosts.append(host)
-        for host in stale_hosts:
-            try:
-                for server_name in list(servers.keys()):
-                    room_map = _room_members(server_name)
-                    for (username, origin_host) in list(room_map.keys()):
-                        if origin_host == host:
-                            last = _authoritative_room_remove_member(server_name, username, origin_host)
-                            if last:
-                                try:
-                                    text = format_room_event_text(MY_SERVER_HOST, 'left', username, origin_host)
-                                except Exception:
-                                    text = f"*** {username}@{origin_host} has left the server."
-                                broadcast_message(text, server_name, sender=username)
-                del s2s_links[host]
-            except Exception as e:
-                log_message(f"Error {host}: {e}.")
+        remote_hosts = set()
+        for server_name in list(servers.keys()):
+            for (_, origin_host) in _room_members(server_name).keys():
+                if origin_host and origin_host != MY_SERVER_HOST:
+                    remote_hosts.add(origin_host)
+        for host in remote_hosts:
+            if not _s2s_ping(host):
+                _kick_remote_host(host)
 
         cleanup_OU()
 
