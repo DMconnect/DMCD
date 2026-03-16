@@ -95,13 +95,13 @@ user_remote_counters = {}
 
 dialback_cache = {}
 pending_dialback = {}
+s2s_fail_count = {}
 
-session_lock = threading.RLock()
-
-SEND_DELAY_SECONDS = 0.15
 _send_queues = {}
 _send_workers = {}
 _send_state_lock = threading.RLock()
+
+session_lock = threading.RLock()
 
 DELAYED_MESSAGE_TYPES = {
     'chat_message',
@@ -115,6 +115,8 @@ DIALBACK_CACHE_TTL = 3600
 MAX_RETRIES = 2
 RETRY_DELAY = 1
 S2S_PING_TIMEOUT = 8
+S2S_PING_FAIL_THRESHOLD = 5
+SEND_DELAY_SECONDS = 0.15
 
 default_server = 'general'
 
@@ -122,7 +124,7 @@ commands = {
     "/login": "<username> <password> - Login with username and password.",
     "/register": "<username> <password> - Register a new user.",
     "/create_server": "<server name> - Create a new communication server.",
-    "/join_server": "<server name > - Log in to the communication server.",
+    "/join_server": "<server name> - Log in to the communication server.",
     "/list_servers": "- Get a list of all available servers for communication.",
     "/members": "- Get list of users on server.",
     "/pm": "<username> <message> - Send a private message to the specified user.",
@@ -644,6 +646,28 @@ def _s2s_ping(host):
     except Exception:
         return False
 
+STATUS_REQUEST_TIMEOUT = 5
+
+def _check_remote_users_online(host, usernames):
+    if not usernames:
+        return {}
+    try:
+        with socket.create_connection((host, 42439), timeout=STATUS_REQUEST_TIMEOUT) as s:
+            s.sendall((json.dumps({'type': 'status_request', 'usernames': list(usernames), 'from_host': get_advertised_host()}) + '\n').encode('utf-8'))
+            s.settimeout(STATUS_REQUEST_TIMEOUT)
+            resp = b''
+            while not resp.endswith(b'\n'):
+                chunk = s.recv(MAX_PACKET_SIZE)
+                if not chunk:
+                    return {u: False for u in usernames}
+                resp += chunk
+            out = json.loads(resp.decode('utf-8', errors='replace').strip())
+            if out.get('status') != 'ok':
+                return {u: False for u in usernames}
+            return out.get('online_map', {})
+    except Exception:
+        return {u: False for u in usernames}
+
 def _kick_remote_host(host):
     for server_name in list(servers.keys()):
         room_map = _room_members(server_name)
@@ -654,6 +678,10 @@ def _kick_remote_host(host):
             if last:
                 text = format_room_event_text(MY_SERVER_HOST, 'left', username, origin_host)
                 broadcast_message(text, server_name, sender=username)
+                try:
+                    threading.Thread(target=_send_room_event_to_remotes, args=(server_name, 'left', username, origin_host, None), daemon=True).start()
+                except Exception:
+                    pass
             _update_remote_subscriber_count(server_name, host)
 
 def _broadcast_room_event_locally(room, event, username, origin_host, payload=None, room_key=None):
@@ -662,7 +690,8 @@ def _broadcast_room_event_locally(room, event, username, origin_host, payload=No
         target_key = room_key or room
         message_type = 'room_event' if event in ['message', 'act'] else 'system'
         sender = f"{username}@{origin_host}" if (origin_host and origin_host != MY_SERVER_HOST) else username
-        broadcast_message(text, target_key, message_type=message_type, sender=sender)
+        exclude = username if (event in ['message', 'act'] and origin_host == MY_SERVER_HOST) else None
+        broadcast_message(text, target_key, message_type=message_type, sender=sender, exclude_username=exclude)
     except Exception:
         pass
 
@@ -696,13 +725,15 @@ class Session:
     def send_text(self, message, message_type='system'):
         return enqueue_send(self.client_socket, message, None, message_type)
     
-def broadcast_message(message, server_name, sender_session=None, message_type='broadcast_message', sender=None):
+def broadcast_message(message, server_name, sender_session=None, message_type='broadcast_message', sender=None, exclude_username=None):
     try:
         with session_lock:
             sessions = list(clients_by_server.get(server_name, set()))
 
         for sess in sessions:
             if sender_session is not None and sess is sender_session:
+                continue
+            if exclude_username and getattr(sess, 'username', None) == exclude_username:
                 continue
             if sender and getattr(sess, 'username', None) and capabilities_manager.should_filter_message(sess.username, sender, 'server'):
                 continue
@@ -939,6 +970,23 @@ def handle_client(client_socket, client_address):
                         data = client_socket.recv(MAX_PACKET_SIZE)
                         try:
                             client_socket.send((json.dumps({'status': 'ok'}) + '\n').encode('utf-8'))
+                        except Exception:
+                            pass
+                        try:
+                            client_socket.close()
+                        except Exception:
+                            pass
+                        return
+                    elif msg.get('type') == 'status_request':
+                        data = client_socket.recv(MAX_PACKET_SIZE)
+                        msg = json.loads(data.decode('utf-8').strip())
+                        usernames = msg.get('usernames')
+                        if not usernames:
+                            usernames = [msg.get('username', '')] if msg.get('username') else []
+                        with session_lock:
+                            online_map = {u: bool(clients_by_user.get(u, set())) for u in usernames}
+                        try:
+                            client_socket.send((json.dumps({'status': 'ok', 'online_map': online_map}) + '\n').encode('utf-8'))
                         except Exception:
                             pass
                         try:
@@ -1346,6 +1394,8 @@ def handle_client(client_socket, client_address):
 
                     room_name, host_part = parse_room_and_host(user_server)
                     if host_part and host_part != MY_SERVER_HOST:
+                        echo_text = format_room_event_text(MY_SERVER_HOST, 'act', logged_in_user, MY_SERVER_HOST, {'act': act_name})
+                        _send_immediate(client_socket, echo_text, client_key)
                         payload = {
                             'type': 'room_act',
                             'room': room_name,
@@ -1431,6 +1481,8 @@ def handle_client(client_socket, client_address):
                 if not logged_in_user in bans and logged_in_user and user_server:
                     room_name, host_part = parse_room_and_host(user_server)
                     if host_part and host_part != MY_SERVER_HOST:
+                        echo_text = format_room_event_text(MY_SERVER_HOST, 'message', logged_in_user, MY_SERVER_HOST, {'text': message})
+                        _send_immediate(client_socket, echo_text, client_key)
                         payload = {
                             'type': 'room_message',
                             'room': room_name,
@@ -1626,6 +1678,10 @@ def _kick_user(identifier):
                     except Exception:
                         text = f"*** {user}@{origin_host} has left the server."
                     broadcast_message(text, server_name, sender=user)
+                    try:
+                        threading.Thread(target=_send_room_event_to_remotes, args=(server_name, 'left', user, origin_host, None), daemon=True).start()
+                    except Exception:
+                        pass
 
                 break
 
@@ -1661,6 +1717,10 @@ def cleanup_OU():
                 if origin_host != MY_SERVER_HOST and last:
                     text = format_room_event_text(MY_SERVER_HOST, 'left', username, origin_host)
                     broadcast_message(text, server_name, sender=username)
+                    try:
+                        threading.Thread(target=_send_room_event_to_remotes, args=(server_name, 'left', username, origin_host, None), daemon=True).start()
+                    except Exception:
+                        pass
 
                 if '@' not in server_name and origin_host == MY_SERVER_HOST:
                     members = servers.get(server_name, [])
@@ -1690,8 +1750,26 @@ def cleanup_tasks():
                 if origin_host and origin_host != MY_SERVER_HOST:
                     remote_hosts.add(origin_host)
         for host in remote_hosts:
-            if not _s2s_ping(host):
-                _kick_remote_host(host)
+            ok = _s2s_ping(host)
+            if ok:
+                s2s_fail_count.pop(host, None)
+            else:
+                n = s2s_fail_count.get(host, 0) + 1
+                s2s_fail_count[host] = n
+                if n >= S2S_PING_FAIL_THRESHOLD:
+                    s2s_fail_count.pop(host, None)
+                    _kick_remote_host(host)
+
+        users_by_host = {}
+        for server_name in list(servers.keys()):
+            for (username, origin_host) in _room_members(server_name).keys():
+                if origin_host and origin_host != MY_SERVER_HOST:
+                    users_by_host.setdefault(origin_host, set()).add(username)
+        for host, usernames in users_by_host.items():
+            online_map = _check_remote_users_online(host, usernames)
+            for username in usernames:
+                if not online_map.get(username, False):
+                    _kick_user(f"{username}@{host}")
 
         cleanup_OU()
 
