@@ -13,7 +13,7 @@ class Capability:
         if command not in self.commands:
             return False
         
-        handler_name = f"handle_{command}"
+        handler_name = f"handle_{command.replace('-', '_')}"
         if hasattr(self, handler_name):
             handler = getattr(self, handler_name)
             return handler(args, session, client_socket, client_key, server_context)

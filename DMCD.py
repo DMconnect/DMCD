@@ -139,6 +139,7 @@ servers = load_servers()
 
 from caps.caps import CapabilitiesManager
 capabilities_manager = CapabilitiesManager()
+from caps import status as status_cap
 
 if default_server not in servers:
     servers[default_server] = []
@@ -994,6 +995,52 @@ def handle_client(client_socket, client_address):
                         except Exception:
                             pass
                         return
+                    elif msg.get('type') in ('presence_subscribe', 'presence_unsubscribe', 'presence_update'):
+                        data = client_socket.recv(MAX_PACKET_SIZE)
+                        msg = json.loads(data.decode('utf-8').strip())
+                        msg_type = msg.get('type')
+                        from_host = msg.get('from_host')
+                        msg_id = msg.get('msg_id')
+
+                        def async_presence_dialback_check():
+                            try:
+                                dialback_ok = send_dialback_check(from_host, msg_id, msg_type)
+                                if not dialback_ok:
+                                    try:
+                                        client_socket.send((json.dumps({'status':'error','reason':'Dialback failed'}) + '\n').encode('utf-8'))
+                                        client_socket.close()
+                                    except Exception:
+                                        pass
+                                    return
+
+                                try:
+                                    from caps import status as status_cap
+                                    if msg_type == 'presence_subscribe':
+                                        status_cap.handle_presence_subscribe(from_host, msg.get('subscriber'), msg.get('target'))
+                                    elif msg_type == 'presence_unsubscribe':
+                                        status_cap.handle_presence_unsubscribe(from_host, msg.get('subscriber'), msg.get('target'))
+                                    elif msg_type == 'presence_update':
+                                        status_cap.handle_presence_update(from_host, msg.get('user'), msg.get('online'))
+                                except Exception:
+                                    pass
+
+                                try:
+                                    client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
+                                except Exception:
+                                    pass
+                                try:
+                                    client_socket.close()
+                                except Exception:
+                                    pass
+                            except Exception:
+                                try:
+                                    client_socket.send((json.dumps({'status':'error','reason':'Internal error'}) + '\n').encode('utf-8'))
+                                    client_socket.close()
+                                except Exception:
+                                    pass
+
+                        threading.Thread(target=async_presence_dialback_check, daemon=True).start()
+                        return
                     elif msg.get('type') in ('room_join','room_leave','room_message','room_act','room_members_request','room_event'):
                         data = client_socket.recv(MAX_PACKET_SIZE)
                         msg = json.loads(data.decode('utf-8').strip())
@@ -1177,6 +1224,7 @@ def handle_client(client_socket, client_address):
                     session.username = username
                     with session_lock:
                         sessions = clients_by_user.get(username)
+                        was_offline = not sessions
                         if sessions is None:
                             clients_by_user[username] = {session}
                         else:
@@ -1185,6 +1233,8 @@ def handle_client(client_socket, client_address):
                         send_to_client(client_socket, "Login successful.", client_key)
                         send_to_client(client_socket, f"Available servers: {', '.join(servers.keys())}", client_key)
                         send_to_client(client_socket, "Select a server using /join_server <server_name>.", client_key)
+                    if was_offline:
+                        status_cap.notify_status_change(username, True)
                 else:
                     send_to_client(client_socket, "Invalid username or password.", client_key)
 
@@ -1513,6 +1563,7 @@ def handle_client(client_socket, client_address):
                                            if hasattr(sess, 'client_socket') and sess.client_socket]
                         if not remaining_sessions:
                             clients_by_user.pop(s.username, None)
+                            status_cap.notify_status_change(s.username, False)
                 if s and s.server_name:
                     server_sessions = clients_by_server.get(s.server_name, set())
                     if s in server_sessions:
@@ -1768,8 +1819,11 @@ def cleanup_tasks():
         for host, usernames in users_by_host.items():
             online_map = _check_remote_users_online(host, usernames)
             for username in usernames:
-                if not online_map.get(username, False):
-                    _kick_user(f"{username}@{host}")
+                ident = f"{username}@{host}"
+                online = bool(online_map.get(username, False))
+                status_cap.notify_status_change(ident, online)
+                if not online:
+                    _kick_user(ident)
 
         cleanup_OU()
 
