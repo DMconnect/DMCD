@@ -489,33 +489,6 @@ def parse_room_and_host(name):
         return name[:idx], name[idx+1:]
     return name, None
 
-silent_disconnect_file = 'silent_disconnect.json'
-
-def _load_silent_disconnect_ids():
-    try:
-        with open(silent_disconnect_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return {str(x).strip().replace(' ', '') for x in data if str(x).strip()}
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-    return set()
-
-def silent_disconnect_match(username, origin_host):
-    if not username or not origin_host:
-        return False
-    ids = _load_silent_disconnect_ids()
-    if not ids:
-        return False
-    full = f"{username}@{origin_host}"
-    if full in ids:
-        return True
-    if origin_host == MY_SERVER_HOST and username in ids:
-        return True
-    return False
-
 def display_name_for(viewer_host, username, origin_host):
     return username if origin_host == viewer_host else f"{username}@{origin_host}"
 
@@ -701,8 +674,6 @@ def _kick_remote_host(host):
         room_map = _room_members(server_name)
         for (username, origin_host) in list(room_map.keys()):
             if origin_host != host:
-                continue
-            if silent_disconnect_match(username, origin_host):
                 continue
             last = _authoritative_room_remove_member(server_name, username, origin_host)
             if last:
@@ -1348,7 +1319,6 @@ def handle_client(client_socket, client_address):
                                 user_server = local_room
                                 session.server_name = local_room
                                 should_broadcast_join = False
-                                was_in_room_before_join = False
                                 with session_lock:
                                     server_sessions = clients_by_server.get(local_room)
                                     if server_sessions is None:
@@ -1360,7 +1330,6 @@ def handle_client(client_socket, client_address):
                                         if not had_sessions_for_user:
                                             should_broadcast_join = True
 
-                                    was_in_room_before_join = (logged_in_user, MY_SERVER_HOST) in _room_members(local_room)
                                     first = _authoritative_room_add_member(local_room, logged_in_user, MY_SERVER_HOST)
                                     if first:
                                         should_broadcast_join = True
@@ -1370,12 +1339,6 @@ def handle_client(client_socket, client_address):
                                         members.append(logged_in_user)
                                         servers[local_room] = members
                                         save_server(local_room, members)
-                                if (
-                                    should_broadcast_join
-                                    and silent_disconnect_match(logged_in_user, MY_SERVER_HOST)
-                                    and was_in_room_before_join
-                                ):
-                                    should_broadcast_join = False
                                 if should_broadcast_join:
                                     broadcast_message(f"*** {logged_in_user} has joined the server.", user_server, sender=logged_in_user)
                                     try:
@@ -1475,39 +1438,7 @@ def handle_client(client_socket, client_address):
                     _, act_name = parts 
 
                     if act_name == "has joined the server." or act_name == "has left the server.":
-                        act_room, act_host = parse_room_and_host(user_server)
-                        if act_host and act_host != MY_SERVER_HOST:
-                            send_to_client(client_socket, "This action is not allowed.", client_key)
-                            continue
-                        if not silent_disconnect_match(logged_in_user, MY_SERVER_HOST):
-                            send_to_client(client_socket, "This action is not allowed.", client_key)
-                            continue
-                        local_room = act_room
-                        if act_name == "has joined the server.":
-                            members = servers.get(local_room, [])
-                            if logged_in_user not in members:
-                                members.append(logged_in_user)
-                                servers[local_room] = members
-                                save_server(local_room, members)
-                            if (logged_in_user, MY_SERVER_HOST) not in _room_members(local_room):
-                                _authoritative_room_add_member(local_room, logged_in_user, MY_SERVER_HOST)
-                            broadcast_message(f"*** {logged_in_user} has joined the server.", user_server, sender=logged_in_user)
-                            try:
-                                threading.Thread(target=_send_room_event_to_remotes, args=(local_room, 'joined', logged_in_user, MY_SERVER_HOST, None), daemon=True).start()
-                            except Exception:
-                                pass
-                        else:
-                            members = servers.get(local_room, [])
-                            if logged_in_user in members:
-                                members.remove(logged_in_user)
-                                servers[local_room] = members
-                                save_server(local_room, members)
-                            _room_members(local_room).pop((logged_in_user, MY_SERVER_HOST), None)
-                            broadcast_message(f"*** {logged_in_user} has left the server.", user_server, sender=logged_in_user)
-                            try:
-                                threading.Thread(target=_send_room_event_to_remotes, args=(local_room, 'left', logged_in_user, MY_SERVER_HOST, None), daemon=True).start()
-                            except Exception:
-                                pass
+                        send_to_client(client_socket, "This action is not allowed.", client_key)
                         continue
 
                     room_name, host_part = parse_room_and_host(user_server)
@@ -1636,20 +1567,19 @@ def handle_client(client_socket, client_address):
                     if '@' not in s.server_name:
                         still_has = any(sess.username == s.username for sess in server_sessions)
                         if not still_has:
-                            if not silent_disconnect_match(s.username, MY_SERVER_HOST):
-                                members = servers.get(s.server_name, [])
-                                if s.username in members:
-                                    members.remove(s.username)
-                                    servers[s.server_name] = members
-                                    save_server(s.server_name, members)
+                            members = servers.get(s.server_name, [])
+                            if s.username in members:
+                                members.remove(s.username)
+                                servers[s.server_name] = members
+                                save_server(s.server_name, members)
 
-                                left_broadcast_needed = (s.username, s.server_name)
-                                last = _authoritative_room_remove_member(s.server_name, s.username, MY_SERVER_HOST)
-                                if last:
-                                    try:
-                                        threading.Thread(target=_send_room_event_to_remotes, args=(s.server_name, 'left', s.username, MY_SERVER_HOST, None), daemon=True).start()
-                                    except Exception:
-                                        pass
+                            left_broadcast_needed = (s.username, s.server_name)
+                            last = _authoritative_room_remove_member(s.server_name, s.username, MY_SERVER_HOST)
+                            if last:
+                                try:
+                                    threading.Thread(target=_send_room_event_to_remotes, args=(s.server_name, 'left', s.username, MY_SERVER_HOST, None), daemon=True).start()
+                                except Exception:
+                                    pass
                     else:
                         try:
                             room_name, host_part = s.server_name.split('@', 1)
@@ -1779,9 +1709,6 @@ def _kick_user(identifier):
                 if host is not None and origin_host != host:
                     continue
 
-                if silent_disconnect_match(user, origin_host):
-                    break
-
                 last = _authoritative_room_remove_member(server_name, user, origin_host)
 
                 if origin_host == MY_SERVER_HOST and '@' not in server_name:
@@ -1832,8 +1759,6 @@ def cleanup_OU():
                         users_to_remove.append((username, origin_host))
 
             for username, origin_host in users_to_remove:
-                if silent_disconnect_match(username, origin_host):
-                    continue
                 last = _authoritative_room_remove_member(server_name, username, origin_host)
                 if origin_host != MY_SERVER_HOST and last:
                     text = format_room_event_text(MY_SERVER_HOST, 'left', username, origin_host)
@@ -1892,7 +1817,7 @@ def cleanup_tasks():
                 ident = f"{username}@{host}"
                 online = bool(online_map.get(username, False))
                 status_cap.notify_status_change(ident, online)
-                if not online and not silent_disconnect_match(username, host):
+                if not online:
                     _kick_user(ident)
 
         cleanup_OU()
