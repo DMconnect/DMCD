@@ -4,7 +4,7 @@
 
 Server for the decentralized DMconnect protocol.
 
-It's extremely simple and lightweight, and you can even connect and communicate using Telnet. [Documentation](https://dmconnectspec.w10.site/) is also available.
+It's extremely simple and lightweight, and you can even connect and communicate using Telnet. [Documentation](https://github.com/DMconnect/DMCD/wiki/Protocol-documentation.) is also available.
 
 ## Requirements
 
