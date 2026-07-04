@@ -27,11 +27,22 @@ jobs:
           pip install pyinstaller
 
       - name: Build
+        run: pyinstaller --onefile DMCD.py
+
+      - name: Copy extra files (Windows)
+        if: runner.os == 'Windows'
         run: |
-          pyinstaller --onefile DMCD.py
+          copy LICENSE dist\
+          xcopy caps dist\caps\ /E /I /Y
+
+      - name: Copy extra files (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cp LICENSE dist/
+          cp -r caps dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ runner.os }}
-          path: dist/*
+          path: dist/
