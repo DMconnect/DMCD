@@ -25,7 +25,7 @@ If you are using **Linux**, you can install it with the system package manager i
 ```
 sudo apt install python3-pycryptodome
 ```
-3. Go to line [67](DMCD.py#L67) in [`DMCD.py`](DMCD.py) and replace `MY_SERVER_HOST` with your server's public domain name or IP address, and `ADMIN_USERNAME` with the administrator username.
+3. Go to line [69](DMCD.py#L69) in [`DMCD.py`](DMCD.py) and replace `MY_SERVER_HOST` with your server's public domain name or IP address, and `ADMIN_USERNAME` with the administrator username.
 4. Start the server using this command:
 ```
 python3 DMCD.py
