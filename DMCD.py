@@ -1964,7 +1964,7 @@ def handle_client(client_socket, client_address):
                                 if reason == 'room_not_found':
                                     send_to_client(client_socket, "Server does not exist.", client_key)
                                 elif reason == 'Dialback failed':
-                                    send_to_client(client_socket, "Remote server rejected the connection.", client_key)
+                                    send_to_client(client_socket, "Server does not exist.", client_key)
                                 else:
                                     send_to_client(client_socket, "Server does not exist.", client_key)
                                 continue
