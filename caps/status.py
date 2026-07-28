@@ -87,7 +87,7 @@ def _send_s2s(host, payload):
 
         out.setdefault('from_host', getattr(DMCD, 'MY_SERVER_HOST', '') or DMCD.get_advertised_host())
         out.setdefault('msg_id', DMCD.generate_msg_id(out.get('type', 'presence'), host, str(time.time())))
-        resp = DMCD._send_remote_room_sync(host, 42439, out)
+        resp = DMCD._send_remote_room_sync(host, out)
         return resp
 
     except Exception:
@@ -371,25 +371,19 @@ class StatusCapability(Capability):
                 username = user_part
             else:
                 try:
-                    with socket.create_connection((host_part, 42439), timeout=_REMOTE_CHECK_TIMEOUT) as s:
-                        req = {'type': 'status_request', 'usernames': [user_part], 'from_host': my_host or ''}
-                        s.sendall((json.dumps(req) + '\n').encode('utf-8'))
-                        s.settimeout(_REMOTE_CHECK_TIMEOUT)
-                        resp = b''
-
-                        while not resp.endswith(b'\n'):
-                            chunk = s.recv(32 * 1024)
-
-                            if not chunk:
-                                break
-
-                            resp += chunk
-
-                    out = json.loads(resp.decode('utf-8', errors='replace').strip() or '{}')
+                    import DMCD
+                    out = DMCD.s2s_link.send_json(
+                        host_part,
+                        {'type': 'status_request', 'usernames': [user_part], 'from_host': my_host or ''},
+                        timeout=_REMOTE_CHECK_TIMEOUT,
+                    )
                     online_map = out.get('online_map') if isinstance(out, dict) else None
                     online = bool(online_map.get(user_part, False)) if isinstance(online_map, dict) else False
-                    self.send_message(f"{user_part}@{host_part} is {'online' if online else 'offline'}.", client_socket, client_key)
-
+                    self.send_message(
+                        f"{user_part}@{host_part} is {'online' if online else 'offline'}.",
+                        client_socket,
+                        client_key,
+                    )
                 except Exception:
                     self.send_message(f"{user_part}@{host_part} is offline.", client_socket, client_key)
 

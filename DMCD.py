@@ -9,6 +9,7 @@ import base64
 import random
 import struct
 import queue
+import select
 import sys
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -103,20 +104,381 @@ _send_state_lock = threading.RLock()
 
 session_lock = threading.RLock()
 
-DELAYED_MESSAGE_TYPES = {
-    'chat_message',
-    'private_message',
-    'action_message',
-    'broadcast_message',
-    'room_event'
-}
+DELAYED_MESSAGE_TYPES = set()
+SEND_DELAY_SECONDS = 0
 
 DIALBACK_CACHE_TTL = 3600
 MAX_RETRIES = 2
 RETRY_DELAY = 1
 S2S_PING_TIMEOUT = 8
 S2S_PING_FAIL_THRESHOLD = 5
-SEND_DELAY_SECONDS = 0.15
+
+CTRL_ESC = 255
+OPT_CMDS = {251, 252, 253, 254}
+STREAM_IDLE_TIMEOUT = 0.05
+STREAM_ENCODINGS = ('cp866', 'cp1251', 'koi8-r')
+ECHO_ERASE = b'\x08 \x08'
+BACKSPACE_KEYS = (8, 127)
+
+
+def squeeze_backspace(chunk):
+    out = bytearray()
+    i = 0
+    n = len(chunk)
+    while i < n:
+        b = chunk[i]
+        if b in BACKSPACE_KEYS:
+            out.append(b)
+            if i + 1 < n and chunk[i + 1] in BACKSPACE_KEYS and chunk[i] != chunk[i + 1]:
+                i += 2
+            else:
+                i += 1
+        else:
+            out.append(b)
+            i += 1
+    return bytes(out)
+
+
+def stream_ready(sock, timeout):
+    try:
+        readable, _, _ = select.select([sock], [], [], timeout)
+        return bool(readable)
+    except Exception:
+        return False
+
+
+def filter_stream(sock, data, stream=None):
+    if stream is not None and CTRL_ESC in data:
+        stream.telnet = True
+        stream.plain_candidate = False
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        b = data[i]
+        if b != CTRL_ESC:
+            out.append(b)
+            i += 1
+            continue
+        if i + 1 >= n:
+            break
+        cmd = data[i + 1]
+        if cmd == CTRL_ESC:
+            out.append(CTRL_ESC)
+            i += 2
+        elif cmd == 253 and i + 2 < n:
+            opt = data[i + 2]
+            if opt == 1:
+                try:
+                    sock.send(bytes([255, 251, 1]))
+                except Exception:
+                    pass
+                if stream is not None:
+                    stream.echo = True
+                    stream.plain_candidate = False
+            elif opt == 3:
+                try:
+                    sock.send(bytes([255, 251, 3]))
+                except Exception:
+                    pass
+            elif opt == 24:
+                try:
+                    sock.send(bytes([255, 252, 24]))
+                except Exception:
+                    pass
+            i += 3
+        elif cmd == 251 and i + 2 < n:
+            opt = data[i + 2]
+            if opt == 3:
+                try:
+                    sock.send(bytes([255, 253, 3]))
+                except Exception:
+                    pass
+            i += 3
+        elif cmd in OPT_CMDS:
+            i += 3 if i + 2 < n else n
+        elif cmd == 250:
+            i += 2
+            while i < n:
+                if data[i] == CTRL_ESC and i + 1 < n and data[i + 1] == 240:
+                    i += 2
+                    break
+                i += 1
+        else:
+            i += 2
+    return bytes(out)
+
+
+class TextStream:
+    def __init__(self):
+        self.pending = b''
+        self.mode = 'interactive'
+        self.encoding = 'cp866'
+        self.encoding_set = False
+        self.echo = False
+        self.telnet = False
+        self.plain_candidate = True
+        self.first_line = True
+        self.break_next = False
+
+    @property
+    def interactive(self):
+        return self.mode == 'interactive'
+
+    @staticmethod
+    def looks_like_tcp_batch(chunk):
+        if not chunk or CTRL_ESC in chunk or chunk[0] == 27:
+            return False
+        if b'\n' in chunk or b'\r' in chunk:
+            return False
+        if len(chunk) <= 1:
+            return False
+        if chunk.startswith(b'{') or chunk.startswith(b'/'):
+            return chunk.isascii()
+        return False
+
+    @staticmethod
+    def looks_like_plain_line_protocol(chunk, telnet=False):
+        if not chunk or telnet or CTRL_ESC in chunk:
+            return False
+        if b'\n' not in chunk or b'\r' in chunk:
+            return False
+        return True
+
+    def activate_plain(self, initial_data=b''):
+        self.mode = 'plain'
+        self.encoding = 'utf-8'
+        self.pending = b''
+        return initial_data
+
+    def _pending_is_keepalive(self):
+        return self.pending in (b'/', b'//')
+
+    def _try_activate_plain(self, sock, data):
+        data = self.activate_plain(data)
+        self.plain_candidate = False
+        return self.read_plain(sock, data)
+
+    def finalize_line(self, text):
+        if text is None:
+            return None
+        if not text:
+            return text
+        if self.first_line:
+            self.first_line = False
+            if text.startswith('//'):
+                text = text[1:]
+        return text
+
+    def finish_line(self, text):
+        result = self.finalize_line(text)
+        if result is not None:
+            self.break_next = True
+        return result
+
+    def note_encoding(self, raw):
+        if not any(b >= 0x80 for b in raw):
+            return
+        if self.encoding_set:
+            return
+        try:
+            text = raw.decode('utf-8')
+            if text.encode('utf-8') == raw:
+                self.encoding = 'utf-8'
+                self.encoding_set = True
+                return
+        except UnicodeDecodeError:
+            pass
+        for enc in STREAM_ENCODINGS:
+            try:
+                raw.decode(enc)
+                self.encoding = enc
+                self.encoding_set = True
+                return
+            except UnicodeDecodeError:
+                continue
+        self.encoding_set = True
+
+    def decode_bytes(self, raw):
+        if not raw:
+            return ''
+        self.note_encoding(raw)
+        try:
+            return raw.decode(self.encoding).strip()
+        except UnicodeDecodeError:
+            return raw.decode(self.encoding, errors='replace').strip()
+
+    def trim_last(self):
+        if not self.pending:
+            return 0
+        if self.encoding != 'utf-8':
+            self.pending = self.pending[:-1]
+            return 1
+        for size in range(1, min(5, len(self.pending) + 1)):
+            try:
+                self.pending[-size:].decode('utf-8')
+                self.pending = self.pending[:-size]
+                return 1
+            except UnicodeDecodeError:
+                continue
+        self.pending = self.pending[:-1]
+        return 1
+
+    def erase_echo(self, sock, steps=1):
+        try:
+            sock.send(ECHO_ERASE * steps)
+        except Exception:
+            pass
+
+    def feed(self, sock, chunk):
+        self.plain_candidate = False
+        chunk = squeeze_backspace(filter_stream(sock, chunk, self))
+        i = 0
+        n = len(chunk)
+        while i < n:
+            b = chunk[i]
+            if b in BACKSPACE_KEYS:
+                if self.trim_last() and self.echo:
+                    self.erase_echo(sock)
+                i += 1
+                continue
+            if b == 27 and i + 1 < n and chunk[i + 1] == ord('['):
+                i += 2
+                while i < n and not (64 <= chunk[i] <= 126):
+                    i += 1
+                if i < n:
+                    i += 1
+                continue
+            if b in (13, 10):
+                self.pending += bytes([b])
+                i += 1
+                continue
+            if b < 32:
+                i += 1
+                continue
+            self.pending += bytes([b])
+            if self.echo:
+                try:
+                    sock.send(bytes([b]))
+                except Exception:
+                    pass
+            i += 1
+
+    def pop_line(self):
+        for sep in (b'\r\n', b'\n', b'\r'):
+            idx = self.pending.find(sep)
+            if idx != -1:
+                line = self.pending[:idx]
+                self.pending = self.pending[idx + len(sep):]
+                if self.pending.startswith(b'\n') and sep == b'\r':
+                    self.pending = self.pending[1:]
+                text = self.decode_bytes(line)
+                return text if text else ''
+        return None
+
+    def drain(self):
+        if not self.pending:
+            return None
+        text = self.decode_bytes(self.pending)
+        self.pending = b''
+        return text if text else None
+
+    def _strip_keepalive_prefix(self, data):
+        if data in (b'/', b'//'):
+            return data
+        if data.startswith(b'//'):
+            return data[1:]
+        if len(data) > 1 and data[:1] == b'/':
+            rest = data[1:]
+            cmd_prefixes = (
+                b'login', b'register', b'join', b'pm ', b'act ', b'help', b'members',
+                b'create', b'list_', b'ban', b'delete',
+            )
+            if not any(rest.startswith(p) for p in cmd_prefixes):
+                return rest
+        return data
+
+    def read_plain(self, sock, first_chunk=None):
+        chunk = first_chunk
+        if chunk is None:
+            try:
+                chunk = sock.recv(MAX_PACKET_SIZE)
+            except Exception:
+                return None
+        if not chunk and not self.pending:
+            return None
+        data = self.pending + chunk if chunk else self.pending
+        self.pending = b''
+        data = self._strip_keepalive_prefix(data)
+        for sep in (b'\r\n', b'\n', b'\r'):
+            idx = data.find(sep)
+            if idx != -1:
+                line = data[:idx]
+                self.pending = data[idx + len(sep):]
+                text = line.decode('utf-8', errors='replace').strip()
+                if text.startswith('//'):
+                    text = text[1:]
+                return text if text else ''
+        text = data.decode('utf-8', errors='replace').strip()
+        if text.startswith('//'):
+            text = text[1:]
+        return text if text else None
+
+    def read(self, sock):
+        if self.mode == 'plain':
+            return self.read_plain(sock)
+
+        while True:
+            line = self.pop_line()
+            if line is not None:
+                return self.finish_line(line)
+
+            try:
+                chunk = sock.recv(MAX_PACKET_SIZE)
+            except Exception:
+                return self.finish_line(self.drain())
+
+            if not chunk:
+                return self.finish_line(self.drain())
+
+            if self.mode != 'plain':
+                if self.plain_candidate and not self.pending and self.looks_like_plain_line_protocol(chunk, self.telnet):
+                    return self._try_activate_plain(sock, chunk)
+                if self.plain_candidate and not self.pending and self.looks_like_tcp_batch(chunk):
+                    return self._try_activate_plain(sock, chunk)
+                if self._pending_is_keepalive() and self.looks_like_tcp_batch(chunk):
+                    return self._try_activate_plain(sock, self.pending + chunk)
+
+            self.feed(sock, chunk)
+
+            line = self.pop_line()
+            if line is not None:
+                return self.finish_line(line)
+
+
+def plain_text_out(message, encoding='utf-8'):
+    message = message.replace('\r\n', '\n').replace('\r', '\n')
+    message = message.replace('\n', '\r\n')
+    if not message.endswith('\r\n'):
+        message += '\r\n'
+    return message.encode(encoding, errors='replace')
+
+
+def plain_send(sock, message, line_break=False):
+    sess = socket_to_session.get(sock)
+    stream = sess.text_in if sess and getattr(sess, 'text_in', None) else None
+
+    if stream and stream.interactive:
+        out = plain_text_out(message, stream.encoding)
+        if stream.echo and (line_break or stream.break_next):
+            out = b'\r\n' + out
+            stream.break_next = False
+    else:
+        if not message.endswith('\n'):
+            message = message.rstrip('\r\n') + '\n'
+        out = message.encode('utf-8')
+
+    sock.send(out)
 
 default_server = 'general'
 
@@ -152,7 +514,7 @@ def _send_worker(sock, q):
             item = q.get()
             if item is None:
                 break
-            message, client_key = item
+            message, client_key, message_type = item
             now = time.time()
             delta = now - last_sent_at
             if SEND_DELAY_SECONDS > 0 and delta < SEND_DELAY_SECONDS:
@@ -166,11 +528,7 @@ def _send_worker(sock, q):
                         enc_key, mac_key = client_key, None
                     send_encrypted_message(sock, message, enc_key, mac_key)
                 else:
-                    if not message.endswith('\n'):
-                        message_to_send = message + '\n'
-                    else:
-                        message_to_send = message
-                    sock.send(message_to_send.encode('utf-8'))
+                    plain_send(sock, message, line_break=message_type in DELAYED_MESSAGE_TYPES)
             except Exception as e:
                 log_message(f"Error sending to client: {e}.")
                 break
@@ -190,7 +548,7 @@ def _send_worker(sock, q):
             except Exception:
                 pass
 
-def _send_immediate(sock, message, client_key=None):
+def _send_immediate(sock, message, client_key=None, message_type='system'):
     try:
         if client_key:
             if isinstance(client_key, tuple):
@@ -199,9 +557,7 @@ def _send_immediate(sock, message, client_key=None):
                 enc_key, mac_key = client_key, None
             return send_encrypted_message(sock, message, enc_key, mac_key)
         else:
-            if not message.endswith('\n'):
-                message += '\n'
-            sock.send(message.encode('utf-8'))
+            plain_send(sock, message, line_break=message_type in DELAYED_MESSAGE_TYPES)
             return True
     except Exception as e:
         log_message(f"Error sending to client: {e}.")
@@ -210,7 +566,7 @@ def _send_immediate(sock, message, client_key=None):
 def enqueue_send(sock, message, client_key=None, message_type='system'):
     try:
         if message_type not in DELAYED_MESSAGE_TYPES:
-            return _send_immediate(sock, message, client_key)
+            return _send_immediate(sock, message, client_key, message_type)
         with _send_state_lock:
             q = _send_queues.get(sock)
             if q is None:
@@ -221,7 +577,7 @@ def enqueue_send(sock, message, client_key=None, message_type='system'):
                 worker = threading.Thread(target=_send_worker, args=(sock, q), daemon=True)
                 _send_workers[sock] = worker
                 worker.start()
-        q.put((message, client_key))
+        q.put((message, client_key, message_type))
         return True
     except Exception:
         return False
@@ -327,6 +683,240 @@ def receive_encrypted_message(socket, key, mac_key=None):
     except Exception as e:
         log_message(f"Error receiving encrypted message: {e}.")
         return None
+
+S2S_MAGIC = b'DMCS\x01'
+S2S_SESSION_TTL = 45
+S2S_CONNECT_TIMEOUT = 4
+S2S_IO_TIMEOUT = 5
+
+def _tcp_nodelay(sock):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+S2S_CAP_TTL = 3600
+
+
+class S2SLink:
+    def __init__(self, dh_p, dh_g, derive_keys, send_encrypted, recv_encrypted,
+                 my_host_fn, max_packet_size=32 * 1024):
+        self.port = 42439
+        self.dh_p = dh_p
+        self.dh_g = dh_g
+        self.derive_keys = derive_keys
+        self.send_encrypted = send_encrypted
+        self.recv_encrypted = recv_encrypted
+        self.my_host_fn = my_host_fn
+        self.max_packet_size = max_packet_size
+        self._lock = threading.RLock()
+        self._caps = {}
+        self._sessions = {}
+
+    def _cap_get(self, host):
+        with self._lock:
+            item = self._caps.get(host)
+            if not item:
+                return None
+            mode, ts = item
+            if time.time() - ts > S2S_CAP_TTL:
+                del self._caps[host]
+                return None
+            return mode
+
+    def _cap_set(self, host, mode):
+        with self._lock:
+            self._caps[host] = (mode, time.time())
+
+    def _close_session(self, host):
+        with self._lock:
+            sess = self._sessions.pop(host, None)
+        if sess:
+            try:
+                sess['sock'].close()
+            except Exception:
+                pass
+
+    def _plain_send(self, host, data, timeout, wait_response):
+        payload = (json.dumps(data, ensure_ascii=False) + '\n').encode('utf-8')
+        with socket.create_connection((host, self.port), timeout=timeout) as sock:
+            _tcp_nodelay(sock)
+            sock.sendall(payload)
+            if not wait_response:
+                return {'status': 'ok'}
+            sock.settimeout(timeout)
+            resp = b''
+            while not resp.endswith(b'\n'):
+                chunk = sock.recv(self.max_packet_size)
+                if not chunk:
+                    break
+                resp += chunk
+            if not resp:
+                return None
+            return json.loads(resp.decode('utf-8', errors='replace').strip())
+
+    def _dh_client(self, sock):
+        len_data = sock.recv(2)
+        if len(len_data) != 2:
+            raise ConnectionError('S2S DH length missing.')
+        blen = struct.unpack('>H', len_data)[0]
+        a_bytes = b''
+        while len(a_bytes) < blen:
+            chunk = sock.recv(blen - len(a_bytes))
+            if not chunk:
+                raise ConnectionError('S2S DH A truncated.')
+            a_bytes += chunk
+        a_remote = int.from_bytes(a_bytes, byteorder='big')
+        b = random.getrandbits(256)
+        b_val = pow(self.dh_g, b, self.dh_p)
+        b_bytes_len = (self.dh_p.bit_length() + 7) // 8
+        b_bytes = b_val.to_bytes(b_bytes_len, byteorder='big').lstrip(b'\x00') or b'\x00'
+        sock.sendall(struct.pack('>H', len(b_bytes)) + b_bytes)
+        shared = pow(a_remote, b, self.dh_p)
+        shared_len = (self.dh_p.bit_length() + 7) // 8
+        shared_bytes = shared.to_bytes(shared_len, byteorder='big').lstrip(b'\x00') or b'\x00'
+        return self.derive_keys(shared_bytes)
+
+    def _dh_server(self, sock):
+        a = random.getrandbits(256)
+        a_val = pow(self.dh_g, a, self.dh_p)
+        a_bytes_len = (self.dh_p.bit_length() + 7) // 8
+        a_bytes = a_val.to_bytes(a_bytes_len, byteorder='big').lstrip(b'\x00') or b'\x00'
+        sock.sendall(struct.pack('>H', len(a_bytes)) + a_bytes)
+        len_data = sock.recv(2)
+        if len(len_data) != 2:
+            raise ConnectionError('S2S DH B length missing.')
+        blen = struct.unpack('>H', len_data)[0]
+        b_bytes = b''
+        while len(b_bytes) < blen:
+            chunk = sock.recv(blen - len(b_bytes))
+            if not chunk:
+                raise ConnectionError('S2S DH B truncated.')
+            b_bytes += chunk
+        b_remote = int.from_bytes(b_bytes, byteorder='big')
+        shared = pow(b_remote, a, self.dh_p)
+        shared_len = (self.dh_p.bit_length() + 7) // 8
+        shared_bytes = shared.to_bytes(shared_len, byteorder='big').lstrip(b'\x00') or b'\x00'
+        return self.derive_keys(shared_bytes)
+
+    def _open_encrypted_session(self, host, timeout):
+        sock = socket.create_connection((host, self.port), timeout=timeout)
+        _tcp_nodelay(sock)
+        sock.settimeout(timeout)
+        sock.sendall(S2S_MAGIC)
+        enc_key, mac_key = self._dh_client(sock)
+        return {
+            'sock': sock, 'enc': enc_key, 'mac': mac_key, 'lock': threading.Lock(),
+            'last_used': time.time(),
+        }
+
+    def _get_session(self, host, timeout):
+        now = time.time()
+        with self._lock:
+            sess = self._sessions.get(host)
+            if sess and now - sess['last_used'] < S2S_SESSION_TTL:
+                return sess
+            if sess:
+                try:
+                    sess['sock'].close()
+                except Exception:
+                    pass
+                self._sessions.pop(host, None)
+        sess = self._open_encrypted_session(host, timeout)
+        with self._lock:
+            self._sessions[host] = sess
+        return sess
+
+    def _encrypted_send(self, host, data, timeout, wait_response):
+        sock = socket.create_connection((host, self.port), timeout=timeout)
+        try:
+            _tcp_nodelay(sock)
+            sock.settimeout(timeout)
+            sock.sendall(S2S_MAGIC)
+            enc_key, mac_key = self._dh_client(sock)
+            text = json.dumps(data, ensure_ascii=False)
+            if not self.send_encrypted(sock, text, enc_key, mac_key):
+                raise ConnectionError('S2S encrypted send failed.')
+            raw = self.recv_encrypted(sock, enc_key, mac_key)
+            if wait_response:
+                if not raw:
+                    raise ConnectionError('S2S encrypted recv failed.')
+                return json.loads(raw)
+            return {'status': 'ok'}
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _encrypted_send_once(self, host, data, timeout):
+        return self._encrypted_send(host, data, timeout, wait_response=False)
+
+    def probe_cap(self, host, timeout=S2S_CONNECT_TIMEOUT):
+        cached = self._cap_get(host)
+        if cached:
+            return cached
+        data = {'type': 's2s_cap', 'from_host': self.my_host_fn()}
+        try:
+            payload = (json.dumps(data, ensure_ascii=False) + '\n').encode('utf-8')
+            with socket.create_connection((host, self.port), timeout=timeout) as sock:
+                _tcp_nodelay(sock)
+                sock.sendall(payload)
+                sock.settimeout(2)
+                resp = b''
+                try:
+                    while not resp.endswith(b'\n'):
+                        chunk = sock.recv(self.max_packet_size)
+                        if not chunk:
+                            break
+                        resp += chunk
+                except socket.timeout:
+                    pass
+                if resp:
+                    line = resp.split(b'\n', 1)[0].strip()
+                    parsed = json.loads(line.decode('utf-8', errors='replace'))
+                    if isinstance(parsed, dict) and parsed.get('status') == 'ok' and parsed.get('encrypted'):
+                        self._cap_set(host, 'encrypted')
+                        return 'encrypted'
+        except Exception:
+            pass
+        self._cap_set(host, 'plain')
+        return 'plain'
+
+    def send_json(self, host, data, timeout=S2S_IO_TIMEOUT, wait_response=True):
+        if not host:
+            return None
+        mode = self.probe_cap(host, timeout=min(timeout, S2S_CONNECT_TIMEOUT))
+        if mode == 'encrypted':
+            try:
+                return self._encrypted_send(host, data, timeout, wait_response)
+            except Exception:
+                self._close_session(host)
+                try:
+                    return self._encrypted_send(host, data, timeout, wait_response)
+                except Exception:
+                    self._cap_set(host, 'plain')
+        return self._plain_send(host, data, timeout, wait_response)
+
+    def handle_inbound(self, sock, process_fn):
+        try:
+            head = sock.recv(len(S2S_MAGIC))
+            if head != S2S_MAGIC:
+                return
+            enc_key, mac_key = self._dh_server(sock)
+            raw = self.recv_encrypted(sock, enc_key, mac_key)
+            if not raw:
+                return
+            msg = json.loads(raw)
+
+            def reply(data):
+                self.send_encrypted(sock, json.dumps(data, ensure_ascii=False), enc_key, mac_key)
+
+            process_fn(msg, reply, sock)
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 def handle_key_exchange(client_socket, client_address):
     try:
@@ -495,6 +1085,306 @@ def display_name_for(viewer_host, username, origin_host):
 def get_advertised_host() -> str:
     return MY_SERVER_HOST
 
+s2s_link = S2SLink(
+    DH_P, DH_G,
+    derive_session_keys,
+    send_encrypted_message,
+    receive_encrypted_message,
+    get_advertised_host,
+    MAX_PACKET_SIZE,
+)
+
+_S2S_INBOUND_TYPES = frozenset({
+    's2s_cap', 'remote_pm', 'dialback_check', 's2s_ping', 'status_request',
+    'presence_subscribe', 'presence_unsubscribe', 'presence_update',
+    'room_join', 'room_leave', 'room_message', 'room_act', 'room_members_request', 'room_event',
+})
+
+def _s2s_close(sock):
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+def _process_s2s_message(msg, reply, sock, client_address):
+    msg_type = msg.get('type')
+
+    if msg_type == 's2s_cap':
+        reply({'status': 'ok', 'encrypted': True})
+        _s2s_close(sock)
+        return
+
+    if msg_type == 'remote_pm':
+        from_host = msg.get('from_host')
+        msg_id = msg.get('msg_id')
+        client_addr = client_address[0]
+        pending_dialback[msg_id] = (
+            msg.get('sender'), msg.get('recipient'), msg.get('message'), reply, sock,
+        )
+
+        def async_dialback_check():
+            try:
+                dialback_ok = send_dialback_check(
+                    from_host, msg_id, 'remote_pm',
+                    sender=msg.get('sender'),
+                    recipient=msg.get('recipient'),
+                    message=msg.get('message'),
+                )
+                if msg_id in pending_dialback:
+                    sender, recipient, message, rep, s = pending_dialback.pop(msg_id)
+                    if dialback_ok:
+                        if recipient not in users:
+                            rep({'status': 'error', 'reason': 'user_not_found'})
+                        else:
+                            delivered = deliver_remote_pm(
+                                sender, recipient, message, server_host=client_addr, from_host=from_host,
+                            )
+                            if delivered:
+                                rep({'status': 'ok'})
+                            else:
+                                rep({'status': 'error', 'reason': 'failed'})
+                    else:
+                        rep({'status': 'error', 'reason': 'Dialback failed'})
+                    _s2s_close(s)
+            except Exception:
+                if msg_id in pending_dialback:
+                    _, _, _, rep, s = pending_dialback.pop(msg_id)
+                    try:
+                        rep({'status': 'error', 'reason': 'Internal error'})
+                        _s2s_close(s)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=async_dialback_check, daemon=True).start()
+        return
+
+    if msg_type == 'dialback_check':
+        resp = handle_dialback_check(msg)
+        reply(resp)
+        _s2s_close(sock)
+        return
+
+    if msg_type == 's2s_ping':
+        reply({'status': 'ok'})
+        _s2s_close(sock)
+        return
+
+    if msg_type == 'status_request':
+        usernames = msg.get('usernames')
+        if not usernames:
+            usernames = [msg.get('username', '')] if msg.get('username') else []
+        with session_lock:
+            online_map = {u: bool(clients_by_user.get(u, set())) for u in usernames}
+        reply({'status': 'ok', 'online_map': online_map})
+        _s2s_close(sock)
+        return
+
+    if msg_type in ('presence_subscribe', 'presence_unsubscribe', 'presence_update'):
+        from_host = msg.get('from_host')
+        msg_id = msg.get('msg_id')
+
+        def async_presence_dialback_check():
+            try:
+                dialback_ok = send_dialback_check(from_host, msg_id, msg_type)
+                if not dialback_ok:
+                    reply({'status': 'error', 'reason': 'Dialback failed'})
+                    _s2s_close(sock)
+                    return
+                try:
+                    from caps import status as status_cap
+                    if msg_type == 'presence_subscribe':
+                        status_cap.handle_presence_subscribe(from_host, msg.get('subscriber'), msg.get('target'))
+                    elif msg_type == 'presence_unsubscribe':
+                        status_cap.handle_presence_unsubscribe(from_host, msg.get('subscriber'), msg.get('target'))
+                    elif msg_type == 'presence_update':
+                        status_cap.handle_presence_update(from_host, msg.get('user'), msg.get('online'))
+                except Exception:
+                    pass
+                reply({'status': 'ok'})
+                _s2s_close(sock)
+            except Exception:
+                try:
+                    reply({'status': 'error', 'reason': 'Internal error'})
+                    _s2s_close(sock)
+                except Exception:
+                    pass
+
+        threading.Thread(target=async_presence_dialback_check, daemon=True).start()
+        return
+
+    if msg_type in ('room_join', 'room_leave', 'room_message', 'room_act', 'room_members_request', 'room_event'):
+        from_host = msg.get('from_host')
+        msg_id = msg.get('msg_id')
+        room = msg.get('room')
+
+        def _room_s2s_worker():
+            try:
+                if msg_type in ('room_join', 'room_leave', 'room_message', 'room_act'):
+                    dialback_ok = send_dialback_check(
+                        from_host, msg_id, msg_type,
+                        sender=msg.get('sender', ''), room=room,
+                    )
+                elif msg_type == 'room_event':
+                    dialback_ok = send_dialback_check(
+                        from_host, msg_id, msg_type,
+                        sender=msg.get('sender', ''), room=room, event=msg.get('event', ''),
+                    )
+                elif msg_type == 'room_members_request':
+                    dialback_ok = send_dialback_check(from_host, msg_id, msg_type, room=room)
+                else:
+                    dialback_ok = False
+
+                if not dialback_ok:
+                    reply({'status': 'error', 'reason': 'Dialback failed'})
+                    _s2s_close(sock)
+                    return
+
+                if msg_type == 'room_event':
+                    event = msg.get('event')
+                    sender = msg.get('sender')
+                    sender_origin = msg.get('sender_origin') or from_host
+                    payload = msg.get('payload') or {}
+                    if from_host != MY_SERVER_HOST and (sender, sender_origin) in _room_members(room):
+                        room_key = room
+                    elif from_host != MY_SERVER_HOST:
+                        room_key = f"{room}@{from_host}"
+                    else:
+                        room_key = room
+                    exclude = None
+                    if sender_origin == MY_SERVER_HOST and event in ('message', 'act'):
+                        exclude = sender
+                    _broadcast_room_event_locally(
+                        room, event, sender, sender_origin, payload,
+                        room_key=room_key, exclude_username=exclude,
+                    )
+                    if event in ('message', 'act') and sender_origin != MY_SERVER_HOST:
+                        try:
+                            threading.Thread(
+                                target=_send_room_event_to_remotes,
+                                args=(room, event, sender, sender_origin, payload),
+                                daemon=True,
+                            ).start()
+                        except Exception:
+                            pass
+                    reply({'status': 'ok'})
+                    _s2s_close(sock)
+                    return
+
+                if msg_type == 'room_members_request':
+                    room_map = _room_members(room)
+                    members = [{'username': u, 'origin': h} for (u, h) in room_map.keys()]
+                    reply({'status': 'ok', 'type': 'room_members_response', 'room': room, 'members': members})
+                    _s2s_close(sock)
+                    return
+
+                if msg_type == 'room_join':
+                    sender = msg.get('sender')
+                    origin_host = from_host
+                    if room not in servers:
+                        reply({'status': 'error', 'reason': 'room_not_found'})
+                        _s2s_close(sock)
+                        return
+                    first = _authoritative_room_add_member(room, sender, origin_host)
+                    _update_remote_subscriber_count(room, origin_host)
+                    if first:
+                        _broadcast_room_event_locally(room, 'joined', sender, origin_host)
+                        try:
+                            threading.Thread(
+                                target=_send_room_event_to_remotes,
+                                args=(room, 'joined', sender, origin_host, None),
+                                daemon=True,
+                            ).start()
+                        except Exception:
+                            pass
+                    reply({'status': 'ok'})
+                    _s2s_close(sock)
+                    return
+
+                if msg_type == 'room_leave':
+                    sender = msg.get('sender')
+                    origin_host = from_host
+                    if not _remote_member_exists(room, sender, origin_host):
+                        reply({'status': 'error', 'reason': 'not_in_room'})
+                        _s2s_close(sock)
+                        return
+                    last = _authoritative_room_remove_member(room, sender, origin_host)
+                    _update_remote_subscriber_count(room, origin_host)
+                    if last:
+                        _broadcast_room_event_locally(room, 'left', sender, origin_host)
+                        try:
+                            threading.Thread(
+                                target=_send_room_event_to_remotes,
+                                args=(room, 'left', sender, origin_host, None),
+                                daemon=True,
+                            ).start()
+                        except Exception:
+                            pass
+                    reply({'status': 'ok'})
+                    _s2s_close(sock)
+                    return
+
+                if msg_type == 'room_message':
+                    sender = msg.get('sender')
+                    origin_host = from_host
+                    if not _remote_member_exists(room, sender, origin_host):
+                        reply({'status': 'error', 'reason': 'not_in_room'})
+                        _s2s_close(sock)
+                        return
+                    payload = msg.get('payload') or {}
+                    _broadcast_room_event_locally(room, 'message', sender, origin_host, payload)
+                    try:
+                        threading.Thread(
+                            target=_send_room_event_to_remotes,
+                            args=(room, 'message', sender, origin_host, payload),
+                            daemon=True,
+                        ).start()
+                    except Exception:
+                        pass
+                    reply({'status': 'ok'})
+                    _s2s_close(sock)
+                    return
+
+                if msg_type == 'room_act':
+                    sender = msg.get('sender')
+                    origin_host = from_host
+                    if not _remote_member_exists(room, sender, origin_host):
+                        reply({'status': 'error', 'reason': 'not_in_room'})
+                        _s2s_close(sock)
+                        return
+                    payload = msg.get('payload') or {}
+                    _broadcast_room_event_locally(room, 'act', sender, origin_host, payload)
+                    try:
+                        threading.Thread(
+                            target=_send_room_event_to_remotes,
+                            args=(room, 'act', sender, origin_host, payload),
+                            daemon=True,
+                        ).start()
+                    except Exception:
+                        pass
+                    reply({'status': 'ok'})
+                    _s2s_close(sock)
+                    return
+
+            except Exception:
+                try:
+                    reply({'status': 'error', 'reason': 'Internal error'})
+                    _s2s_close(sock)
+                except Exception:
+                    pass
+
+        if get_cached_dialback_result(from_host, msg_type):
+            _room_s2s_worker()
+        else:
+            threading.Thread(target=_room_s2s_worker, daemon=True).start()
+        return
+
+def _s2s_inbound_encrypted(msg, reply, sock):
+    try:
+        addr = sock.getpeername()
+    except Exception:
+        addr = ('0.0.0.0', 0)
+    _process_s2s_message(msg, reply, sock, addr)
+
 def format_room_event_text(viewer_host, event, username, origin_host, payload=None):
     disp = display_name_for(viewer_host, username, origin_host)
     if event == 'joined':
@@ -589,32 +1479,20 @@ def send_dialback_check(from_host, msg_id, msg_type, **kwargs):
     
     def _send_dialback():
         try:
-            with socket.create_connection((from_host, 42439), timeout=5) as s:
-                data = {
-                    'type': 'dialback_check',
-                    'msg_id': msg_id,
-                    'msg_type': msg_type,
-                    'from_host': MY_SERVER_HOST,
-                    **kwargs
-                }
-                s.sendall((json.dumps(data) + '\n').encode('utf-8'))
-                s.settimeout(5)
-                response = b''
-                while not response.endswith(b'\n'):
-                    chunk = s.recv(MAX_PACKET_SIZE)
-                    if not chunk:
-                        break
-                    response += chunk
-                try:
-                    resp_json = json.loads(response.decode('utf-8').strip())
-                    result = resp_json.get('result') == 'ok'
-
-                    if result:
-                        cache_dialback_result(from_host, msg_type, True)
-                    return result
-                except Exception as e:
-                    log_message(f"[dialback_check] Error parsing response: {e}.")
-                    return False
+            data = {
+                'type': 'dialback_check',
+                'msg_id': msg_id,
+                'msg_type': msg_type,
+                'from_host': MY_SERVER_HOST,
+                **kwargs
+            }
+            resp_json = s2s_link.send_json(from_host, data)
+            if not isinstance(resp_json, dict):
+                return False
+            result = resp_json.get('result') == 'ok'
+            if result:
+                cache_dialback_result(from_host, msg_type, True)
+            return result
         except Exception as e:
             log_message(f"[dialback_check] Connection error: {e}.")
             raise
@@ -625,25 +1503,42 @@ def send_remote_room_message(host, room, payload):
     if host is None:
         return None
     data = {
-        'msg_id': generate_msg_id(payload.get('sender', ''), room, payload.get('event', payload.get('type',''))),
+        'msg_id': _room_payload_msg_id(payload, room),
         'from_host': get_advertised_host(),
         **payload
     }
-    return _send_remote_room_sync(host, 42439, data)
+    if data.get('type') == 'room_event':
+        try:
+            s2s_link.send_json(host, data, wait_response=False)
+        except Exception:
+            pass
+        return {'status': 'ok'}
+    return _send_remote_room_sync(host, data)
+
+def _remote_join_room(host, room, username):
+    payload = {
+        'type': 'room_join',
+        'room': room,
+        'sender': username,
+    }
+    try:
+        resp = send_remote_room_message(host, room, payload)
+        if isinstance(resp, dict) and resp.get('status') == 'ok':
+            cache_dialback_result(host, 'room_event', True)
+            return True, None
+        reason = resp.get('reason') if isinstance(resp, dict) else None
+        return False, reason or 'unreachable'
+    except Exception:
+        return False, 'unreachable'
 
 def _s2s_ping(host):
     try:
-        with socket.create_connection((host, 42439), timeout=S2S_PING_TIMEOUT) as s:
-            s.sendall((json.dumps({'type': 's2s_ping', 'from_host': get_advertised_host()}) + '\n').encode('utf-8'))
-            s.settimeout(S2S_PING_TIMEOUT)
-            resp = b''
-            while not resp.endswith(b'\n'):
-                chunk = s.recv(MAX_PACKET_SIZE)
-                if not chunk:
-                    return False
-                resp += chunk
-            out = json.loads(resp.decode('utf-8', errors='replace').strip())
-            return out.get('status') == 'ok'
+        out = s2s_link.send_json(
+            host,
+            {'type': 's2s_ping', 'from_host': get_advertised_host()},
+            timeout=S2S_PING_TIMEOUT,
+        )
+        return isinstance(out, dict) and out.get('status') == 'ok'
     except Exception:
         return False
 
@@ -653,19 +1548,14 @@ def _check_remote_users_online(host, usernames):
     if not usernames:
         return {}
     try:
-        with socket.create_connection((host, 42439), timeout=STATUS_REQUEST_TIMEOUT) as s:
-            s.sendall((json.dumps({'type': 'status_request', 'usernames': list(usernames), 'from_host': get_advertised_host()}) + '\n').encode('utf-8'))
-            s.settimeout(STATUS_REQUEST_TIMEOUT)
-            resp = b''
-            while not resp.endswith(b'\n'):
-                chunk = s.recv(MAX_PACKET_SIZE)
-                if not chunk:
-                    return {u: False for u in usernames}
-                resp += chunk
-            out = json.loads(resp.decode('utf-8', errors='replace').strip())
-            if out.get('status') != 'ok':
-                return {u: False for u in usernames}
-            return out.get('online_map', {})
+        out = s2s_link.send_json(
+            host,
+            {'type': 'status_request', 'usernames': list(usernames), 'from_host': get_advertised_host()},
+            timeout=STATUS_REQUEST_TIMEOUT,
+        )
+        if not isinstance(out, dict) or out.get('status') != 'ok':
+            return {u: False for u in usernames}
+        return out.get('online_map', {})
     except Exception:
         return {u: False for u in usernames}
 
@@ -685,31 +1575,34 @@ def _kick_remote_host(host):
                     pass
             _update_remote_subscriber_count(server_name, host)
 
-def _broadcast_room_event_locally(room, event, username, origin_host, payload=None, room_key=None):
+def _broadcast_room_event_locally(room, event, username, origin_host, payload=None, room_key=None, exclude_username=None):
     try:
         text = format_room_event_text(MY_SERVER_HOST, event, username, origin_host, payload)
         target_key = room_key or room
         message_type = 'room_event' if event in ['message', 'act'] else 'system'
         sender = f"{username}@{origin_host}" if (origin_host and origin_host != MY_SERVER_HOST) else username
-        broadcast_message(text, target_key, message_type=message_type, sender=sender, exclude_username=None)
+        broadcast_message(
+            text, target_key, message_type=message_type, sender=sender,
+            exclude_username=exclude_username,
+        )
     except Exception:
         pass
 
 def _send_room_event_to_remotes(room, event, username, origin_host, payload=None):
     subs = list(_remote_subscribers(room))
+    data = {
+        'type': 'room_event',
+        'room': room,
+        'event': event,
+        'sender': username,
+        'sender_origin': origin_host,
+        'from_host': MY_SERVER_HOST,
+        'payload': payload or {}
+    }
+    data['msg_id'] = _room_payload_msg_id(data, room)
     for host in subs:
         if host == MY_SERVER_HOST:
             continue
-        data = {
-            'type': 'room_event',
-            'room': room,
-            'event': event,
-            'sender': username,
-            'sender_origin': origin_host,
-            'msg_id': generate_msg_id(username, room, event),
-            'from_host': MY_SERVER_HOST,
-            'payload': payload or {}
-        }
         try:
             send_remote_room_message(host, room, data)
         except Exception:
@@ -781,34 +1674,34 @@ def get_client_encryption_key(session):
         return None
 
 def generate_msg_id(sender, recipient, message):
-    base = f"{sender}:{recipient}:{message}:{int(time.time())}"
+    base = f"{sender}:{recipient}:{message}:{time.time_ns()}"
     return hashlib.sha256(base.encode()).hexdigest()
+
+def _room_payload_msg_id(payload, room):
+    ptype = payload.get('type', '')
+    extra = ptype
+    pl = payload.get('payload') or {}
+    if ptype in ('room_message', 'room_act'):
+        extra = pl.get('text') or pl.get('act') or ptype
+    elif ptype == 'room_event':
+        extra = f"{payload.get('event', '')}:{pl.get('text') or pl.get('act') or ''}"
+    return generate_msg_id(payload.get('sender', ''), room, extra)
 
 def _send_remote_private_message_sync(sender, recipient, host, message):
     try:
         msg_id = generate_msg_id(sender, recipient, message)
-        with socket.create_connection((host, 42439), timeout=5) as s:
-            data = {
-                'type': 'remote_pm',
-                'sender': sender,
-                'recipient': recipient,
-                'message': message,
-                'from_host': MY_SERVER_HOST,
-                'msg_id': msg_id
-            }
-            s.sendall((json.dumps(data) + '\n').encode('utf-8'))
-            s.settimeout(5)
-            response = b''
-            while not response.endswith(b'\n'):
-                chunk = s.recv(MAX_PACKET_SIZE)
-                if not chunk:
-                    break
-                response += chunk
-            try:
-                resp_json = json.loads(response.decode('utf-8').strip())
-                return resp_json
-            except Exception:
-                return {'status': 'error', 'reason': 'parse_error'}
+        data = {
+            'type': 'remote_pm',
+            'sender': sender,
+            'recipient': recipient,
+            'message': message,
+            'from_host': MY_SERVER_HOST,
+            'msg_id': msg_id
+        }
+        resp_json = s2s_link.send_json(host, data)
+        if isinstance(resp_json, dict):
+            return resp_json
+        return {'status': 'error', 'reason': 'parse_error'}
     except Exception:
         return {'status': 'error', 'reason': 'network_error'}
 
@@ -877,7 +1770,23 @@ def handle_remote_pm_tcp(sender, recipient, host, private_message, client_socket
 def send_to_client(client_socket, message, client_key=None, message_type='system'):
     return enqueue_send(client_socket, message, client_key, message_type)
 
-def receive_from_client(client_socket, client_key=None):
+def _send_immediate_to_session(session, client_key, message, message_type='system'):
+    if not session or not getattr(session, 'client_socket', None):
+        return False
+    return _send_immediate(session.client_socket, message, client_key, message_type)
+
+def _echo_room_event(session, client_key, event, username, origin_host, payload=None):
+    text = format_room_event_text(MY_SERVER_HOST, event, username, origin_host, payload)
+    return _send_immediate_to_session(session, client_key, text, 'room_event')
+
+def _send_remote_room_async(host, room, payload):
+    threading.Thread(
+        target=send_remote_room_message,
+        args=(host, room, payload),
+        daemon=True,
+    ).start()
+
+def receive_from_client(client_socket, client_key=None, text_in=None):
     try:
         if client_key:
             if isinstance(client_key, tuple):
@@ -886,8 +1795,9 @@ def receive_from_client(client_socket, client_key=None):
                 enc_key, mac_key = client_key, None
             return receive_encrypted_message(client_socket, enc_key, mac_key)
         else:
-            data = client_socket.recv(MAX_PACKET_SIZE).decode('utf-8').strip()
-            return data if data else None
+            if text_in is None:
+                text_in = TextStream()
+            return text_in.read(client_socket)
     except Exception as e:
         log_message(f"Error receiving from client: {e}.")
         return None
@@ -899,9 +1809,15 @@ def handle_client(client_socket, client_address):
     user_server = None
     session = Session(client_socket)
     last_cmd = ""
+    text_in = None
     
     client_key = client_keys.get(client_address)
     use_encryption = client_key is not None
+
+    if not use_encryption:
+        text_in = TextStream()
+    session.text_in = text_in
+    socket_to_session[client_socket] = session
 
     log_message(f"TCP client {client_address} connected {'(encrypted)' if use_encryption else '(unencrypted)'}.")
 
@@ -912,272 +1828,30 @@ def handle_client(client_socket, client_address):
             if peek:
                 try:
                     msg = json.loads(peek.decode('utf-8').strip())
-                    if msg.get('type') == 'remote_pm':
+                    if msg.get('type') in _S2S_INBOUND_TYPES:
                         data = client_socket.recv(MAX_PACKET_SIZE)
                         msg = json.loads(data.decode('utf-8').strip())
-                        from_host = msg.get('from_host')
-                        msg_id = msg.get('msg_id')
-                        client_addr = client_address[0]
-                        pending_dialback[msg_id] = (msg.get('sender'), msg.get('recipient'), msg.get('message'), client_socket)
-                        
-                        def async_dialback_check():
-                            try:
-                                dialback_ok = send_dialback_check(
-                                    from_host, msg_id, 'remote_pm',
-                                    sender=msg.get('sender'),
-                                    recipient=msg.get('recipient'),
-                                    message=msg.get('message')
-                                )
-                                
-                                if msg_id in pending_dialback:
-                                    sender, recipient, message, sock = pending_dialback.pop(msg_id)
-                                    
-                                    if dialback_ok:
-                                        if recipient not in users:
-                                            sock.send((json.dumps({'status': 'error', 'reason': 'user_not_found'}) + '\n').encode('utf-8'))
-                                        else:
-                                            def _deliver_pm():
-                                                return deliver_remote_pm(sender, recipient, message, server_host=client_addr, from_host=from_host)
 
-                                            delivered = _deliver_pm()
-                                            if delivered:
-                                                sock.send((json.dumps({'status': 'ok'}) + '\n').encode('utf-8'))
-                                            else:
-                                                sock.send((json.dumps({'status': 'error', 'reason': 'failed'}) + '\n').encode('utf-8'))
-                                    else:
-                                        sock.send((json.dumps({'status': 'error', 'reason': 'Dialback failed'}) + '\n').encode('utf-8'))
-                                        
-                                    sock.close()
-                            except Exception:
-                                if msg_id in pending_dialback:
-                                    _, _, _, sock = pending_dialback.pop(msg_id)
-                                    try:
-                                        sock.send((json.dumps({'status': 'error', 'reason': 'Internal error'}) + '\n').encode('utf-8'))
-                                        sock.close()
-                                    except:
-                                        pass
-                        
-                        threading.Thread(target=async_dialback_check, daemon=True).start()
-                        return
-                    elif msg.get('type') == 'dialback_check':
-                        data = client_socket.recv(MAX_PACKET_SIZE)
-                        msg = json.loads(data.decode('utf-8').strip())
-                        resp = handle_dialback_check(msg)
-                        client_socket.send((json.dumps(resp) + '\n').encode('utf-8'))
-                        client_socket.close()
-                        return
-                    elif msg.get('type') == 's2s_ping':
-                        data = client_socket.recv(MAX_PACKET_SIZE)
-                        try:
-                            client_socket.send((json.dumps({'status': 'ok'}) + '\n').encode('utf-8'))
-                        except Exception:
-                            pass
-                        try:
-                            client_socket.close()
-                        except Exception:
-                            pass
-                        return
-                    elif msg.get('type') == 'status_request':
-                        data = client_socket.recv(MAX_PACKET_SIZE)
-                        msg = json.loads(data.decode('utf-8').strip())
-                        usernames = msg.get('usernames')
-                        if not usernames:
-                            usernames = [msg.get('username', '')] if msg.get('username') else []
-                        with session_lock:
-                            online_map = {u: bool(clients_by_user.get(u, set())) for u in usernames}
-                        try:
-                            client_socket.send((json.dumps({'status': 'ok', 'online_map': online_map}) + '\n').encode('utf-8'))
-                        except Exception:
-                            pass
-                        try:
-                            client_socket.close()
-                        except Exception:
-                            pass
-                        return
-                    elif msg.get('type') in ('presence_subscribe', 'presence_unsubscribe', 'presence_update'):
-                        data = client_socket.recv(MAX_PACKET_SIZE)
-                        msg = json.loads(data.decode('utf-8').strip())
-                        msg_type = msg.get('type')
-                        from_host = msg.get('from_host')
-                        msg_id = msg.get('msg_id')
+                        def _plain_reply(payload):
+                            client_socket.send(
+                                (json.dumps(payload, ensure_ascii=False) + '\n').encode('utf-8')
+                            )
 
-                        def async_presence_dialback_check():
-                            try:
-                                dialback_ok = send_dialback_check(from_host, msg_id, msg_type)
-                                if not dialback_ok:
-                                    try:
-                                        client_socket.send((json.dumps({'status':'error','reason':'Dialback failed'}) + '\n').encode('utf-8'))
-                                        client_socket.close()
-                                    except Exception:
-                                        pass
-                                    return
-
-                                try:
-                                    from caps import status as status_cap
-                                    if msg_type == 'presence_subscribe':
-                                        status_cap.handle_presence_subscribe(from_host, msg.get('subscriber'), msg.get('target'))
-                                    elif msg_type == 'presence_unsubscribe':
-                                        status_cap.handle_presence_unsubscribe(from_host, msg.get('subscriber'), msg.get('target'))
-                                    elif msg_type == 'presence_update':
-                                        status_cap.handle_presence_update(from_host, msg.get('user'), msg.get('online'))
-                                except Exception:
-                                    pass
-
-                                try:
-                                    client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
-                                except Exception:
-                                    pass
-                                try:
-                                    client_socket.close()
-                                except Exception:
-                                    pass
-                            except Exception:
-                                try:
-                                    client_socket.send((json.dumps({'status':'error','reason':'Internal error'}) + '\n').encode('utf-8'))
-                                    client_socket.close()
-                                except Exception:
-                                    pass
-
-                        threading.Thread(target=async_presence_dialback_check, daemon=True).start()
-                        return
-                    elif msg.get('type') in ('room_join','room_leave','room_message','room_act','room_members_request','room_event'):
-                        data = client_socket.recv(MAX_PACKET_SIZE)
-                        msg = json.loads(data.decode('utf-8').strip())
-                        msg_type = msg.get('type')
-                        from_host = msg.get('from_host')
-                        msg_id = msg.get('msg_id')
-                        room = msg.get('room')
-                        
-                        def async_room_dialback_check():
-                            try:
-                                
-                                dialback_ok = False
-                                if msg_type in ('room_join', 'room_leave', 'room_message', 'room_act'):
-                                    dialback_ok = send_dialback_check(
-                                        from_host, msg_id, msg_type,
-                                        sender=msg.get('sender', ''),
-                                        room=room
-                                    )
-                                elif msg_type == 'room_event':
-                                    dialback_ok = send_dialback_check(
-                                        from_host, msg_id, msg_type,
-                                        sender=msg.get('sender', ''),
-                                        room=room,
-                                        event=msg.get('event', '')
-                                    )
-                                elif msg_type == 'room_members_request':
-                                    dialback_ok = send_dialback_check(
-                                        from_host, msg_id, msg_type,
-                                        room=room
-                                    )
-                                
-                                
-                                if not dialback_ok:
-                                    client_socket.send((json.dumps({'status':'error','reason':'Dialback failed'}) + '\n').encode('utf-8'))
-                                    client_socket.close()
-                                    return
-                                
-                                
-                                if msg_type == 'room_event':
-                                    event = msg.get('event')
-                                    sender = msg.get('sender')
-                                    sender_origin = msg.get('sender_origin') or from_host
-                                    payload = msg.get('payload') or {}
-                                    room_key = f"{room}@{from_host}"
-                                    _broadcast_room_event_locally(room, event, sender, sender_origin, payload, room_key=room_key)
-                                    client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
-                                    client_socket.close()
-                                    return
-                                    
-                                elif msg_type == 'room_members_request':
-                                    room_map = _room_members(room)
-                                    members = [{'username': u, 'origin': h} for (u,h) in room_map.keys()]
-                                    resp = {'status':'ok','type':'room_members_response','room':room,'members':members}
-                                    client_socket.send((json.dumps(resp) + '\n').encode('utf-8'))
-                                    client_socket.close()
-                                    return
-                                    
-                                elif msg_type == 'room_join':
-                                    sender = msg.get('sender')
-                                    origin_host = from_host
-                                    first = _authoritative_room_add_member(room, sender, origin_host)
-                                    _update_remote_subscriber_count(room, origin_host)
-                                    if first:
-                                        _broadcast_room_event_locally(room, 'joined', sender, origin_host)
-                                        try:
-                                            threading.Thread(target=_send_room_event_to_remotes, args=(room, 'joined', sender, origin_host, None), daemon=True).start()
-                                        except Exception:
-                                            pass
-                                    client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
-                                    client_socket.close()
-                                    return
-                                    
-                                elif msg_type == 'room_leave':
-                                    sender = msg.get('sender')
-                                    origin_host = from_host
-                                    if not _remote_member_exists(room, sender, origin_host):
-                                        client_socket.send((json.dumps({'status':'error','reason':'not_in_room'}) + '\n').encode('utf-8'))
-                                        client_socket.close()
-                                        return
-                                    last = _authoritative_room_remove_member(room, sender, origin_host)
-                                    _update_remote_subscriber_count(room, origin_host)
-                                    if last:
-                                        _broadcast_room_event_locally(room, 'left', sender, origin_host)
-                                        try:
-                                            threading.Thread(target=_send_room_event_to_remotes, args=(room, 'left', sender, origin_host, None), daemon=True).start()
-                                        except Exception:
-                                            pass
-                                    client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
-                                    client_socket.close()
-                                    return
-                                    
-                                elif msg_type == 'room_message':
-                                    sender = msg.get('sender')
-                                    origin_host = from_host
-                                    if not _remote_member_exists(room, sender, origin_host):
-                                        client_socket.send((json.dumps({'status':'error','reason':'not_in_room'}) + '\n').encode('utf-8'))
-                                        client_socket.close()
-                                        return
-                                    payload = msg.get('payload') or {}
-                                    _broadcast_room_event_locally(room, 'message', sender, origin_host, payload)
-                                    
-                                    def _send_to_federation():
-                                        _send_room_event_to_remotes(room, 'message', sender, origin_host, payload)
-                                        return True
-                                    
-                                    send_with_retry(_send_to_federation)
-                                    client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
-                                    client_socket.close()
-                                    return
-                                    
-                                elif msg_type == 'room_act':
-                                    sender = msg.get('sender')
-                                    origin_host = from_host
-                                    if not _remote_member_exists(room, sender, origin_host):
-                                        client_socket.send((json.dumps({'status':'error','reason':'not_in_room'}) + '\n').encode('utf-8'))
-                                        client_socket.close()
-                                        return
-                                    payload = msg.get('payload') or {}
-                                    _broadcast_room_event_locally(room, 'act', sender, origin_host, payload)
-                                    try:
-                                        threading.Thread(target=_send_room_event_to_remotes, args=(room, 'act', sender, origin_host, payload), daemon=True).start()
-                                    except Exception:
-                                        pass
-                                    client_socket.send((json.dumps({'status':'ok'}) + '\n').encode('utf-8'))
-                                    client_socket.close()
-                                    return
-                                    
-                            except Exception:
-                                try:
-                                    client_socket.send((json.dumps({'status':'error','reason':'Internal error'}) + '\n').encode('utf-8'))
-                                    client_socket.close()
-                                except:
-                                    pass
-                        
-                        threading.Thread(target=async_room_dialback_check, daemon=True).start()
+                        _process_s2s_message(msg, _plain_reply, client_socket, client_address)
                         return
                 except Exception:
-                    pass
+                    if not use_encryption and text_in and peek:
+                        if CTRL_ESC in peek:
+                            text_in.telnet = True
+                            text_in.plain_candidate = False
+                        elif TextStream.looks_like_plain_line_protocol(peek):
+                            text_in.mode = 'plain'
+                            text_in.encoding = 'utf-8'
+                            text_in.plain_candidate = False
+                        elif peek in (b'/', b'//') or TextStream.looks_like_tcp_batch(peek):
+                            text_in.mode = 'plain'
+                            text_in.encoding = 'utf-8'
+                            text_in.plain_candidate = False
         except socket.timeout:
             pass
 
@@ -1188,7 +1862,8 @@ def handle_client(client_socket, client_address):
                 send_to_client(client_socket, "Enter command (/login /register): ", client_key)
             else:
                 send_to_client(client_socket, "*Ping!*", client_key)
-            command = receive_from_client(client_socket, client_key)
+
+            command = receive_from_client(client_socket, client_key, text_in)
 
             if not command:
                 break
@@ -1245,7 +1920,7 @@ def handle_client(client_socket, client_address):
 
     try:
         while True:
-            message = receive_from_client(client_socket, client_key)
+            message = receive_from_client(client_socket, client_key, text_in)
 
             if not message:
                 break
@@ -1278,16 +1953,26 @@ def handle_client(client_socket, client_address):
                         if user_server is not None:
                             send_to_client(client_socket, f"You're already connected to the server '{user_server}'.", client_key)
                             continue
-                            
-                        try:
-                            with socket.create_connection((host_part, 42439), timeout=3):
-                                pass
-                        except Exception:
-                            send_to_client(client_socket, "Server does not exist.", client_key)
-                            continue
+
+                        remote_key = (logged_in_user, room_name, host_part)
+                        with session_lock:
+                            need_room_join = user_remote_counters.get(remote_key, 0) == 0
+
+                        if need_room_join:
+                            ok, reason = _remote_join_room(host_part, room_name, logged_in_user)
+                            if not ok:
+                                if reason == 'room_not_found':
+                                    send_to_client(client_socket, "Server does not exist.", client_key)
+                                elif reason == 'Dialback failed':
+                                    send_to_client(client_socket, "Remote server rejected the connection.", client_key)
+                                else:
+                                    send_to_client(client_socket, "Server does not exist.", client_key)
+                                continue
+                        else:
+                            ok = True
+
                         user_server = f"{room_name}@{host_part}"
                         session.server_name = user_server
-                        should_remote_join = False
                         with session_lock:
                             server_sessions = clients_by_server.get(user_server)
                             if server_sessions is None:
@@ -1295,18 +1980,8 @@ def handle_client(client_socket, client_address):
                             else:
                                 server_sessions.add(session)
 
-                            key = (logged_in_user, room_name, host_part)
-                            prev = user_remote_counters.get(key, 0)
-                            user_remote_counters[key] = prev + 1
-                            if prev == 0:
-                                should_remote_join = True
-                        if should_remote_join:
-                            payload = {
-                                'type':'room_join',
-                                'room': room_name,
-                                'sender': logged_in_user
-                            }
-                            send_remote_room_message(host_part, room_name, payload)
+                            prev = user_remote_counters.get(remote_key, 0)
+                            user_remote_counters[remote_key] = prev + 1
                         send_to_client(client_socket, f"Joined server '{user_server}' successfully.", client_key)
                     else:
                         local_room = room_name
@@ -1318,31 +1993,37 @@ def handle_client(client_socket, client_address):
                             else:
                                 user_server = local_room
                                 session.server_name = local_room
-                                should_broadcast_join = False
+                                should_announce_join = False
                                 with session_lock:
                                     server_sessions = clients_by_server.get(local_room)
+                                    had_same_user = False
                                     if server_sessions is None:
                                         clients_by_server[local_room] = {session}
-                                        should_broadcast_join = True
                                     else:
-                                        had_sessions_for_user = any(s.username == logged_in_user for s in server_sessions)
+                                        had_same_user = any(
+                                            sess.username == logged_in_user for sess in server_sessions
+                                        )
                                         server_sessions.add(session)
-                                        if not had_sessions_for_user:
-                                            should_broadcast_join = True
 
-                                    first = _authoritative_room_add_member(local_room, logged_in_user, MY_SERVER_HOST)
-                                    if first:
-                                        should_broadcast_join = True
-
-                                    members = servers.get(local_room, [])
-                                    if logged_in_user not in members:
-                                        members.append(logged_in_user)
-                                        servers[local_room] = members
-                                        save_server(local_room, members)
-                                if should_broadcast_join:
-                                    broadcast_message(f"*** {logged_in_user} has joined the server.", user_server, sender=logged_in_user)
+                                    first_ref = _authoritative_room_add_member(
+                                        local_room, logged_in_user, MY_SERVER_HOST,
+                                    )
+                                    should_announce_join = first_ref and not had_same_user
+                                    if should_announce_join:
+                                        members = servers.get(local_room, [])
+                                        if logged_in_user not in members:
+                                            members.append(logged_in_user)
+                                            servers[local_room] = members
+                                            save_server(local_room, members)
+                                if should_announce_join:
+                                    join_text = f"*** {logged_in_user} has joined the server."
+                                    broadcast_message(join_text, user_server, sender=logged_in_user)
                                     try:
-                                        threading.Thread(target=_send_room_event_to_remotes, args=(local_room, 'joined', logged_in_user, MY_SERVER_HOST, None), daemon=True).start()
+                                        threading.Thread(
+                                            target=_send_room_event_to_remotes,
+                                            args=(local_room, 'joined', logged_in_user, MY_SERVER_HOST, None),
+                                            daemon=True,
+                                        ).start()
                                     except Exception:
                                         pass
                                 send_to_client(client_socket, f"Joined server '{local_room}' successfully.", client_key)
@@ -1443,17 +2124,28 @@ def handle_client(client_socket, client_address):
 
                     room_name, host_part = parse_room_and_host(user_server)
                     if host_part and host_part != MY_SERVER_HOST:
+                        _echo_room_event(session, client_key, 'act', logged_in_user, MY_SERVER_HOST, {'act': act_name})
                         payload = {
                             'type': 'room_act',
                             'room': room_name,
                             'sender': logged_in_user,
-                            'payload': {'act': act_name}
+                            'payload': {'act': act_name},
                         }
-                        send_remote_room_message(host_part, room_name, payload)
+                        _send_remote_room_async(host_part, room_name, payload)
                     else:
-                        broadcast_message(f"*** {logged_in_user} {act_name}", user_server, message_type='action_message', sender=logged_in_user)
+                        act_text = f"*** {logged_in_user} {act_name}"
+                        broadcast_message(
+                            act_text,
+                            user_server,
+                            message_type='action_message',
+                            sender=logged_in_user,
+                        )
                         try:
-                            threading.Thread(target=_send_room_event_to_remotes, args=(room_name, 'act', logged_in_user, MY_SERVER_HOST, {'act': act_name}), daemon=True).start()
+                            threading.Thread(
+                                target=_send_room_event_to_remotes,
+                                args=(room_name, 'act', logged_in_user, MY_SERVER_HOST, {'act': act_name}),
+                                daemon=True,
+                            ).start()
                         except Exception:
                             pass
                 elif message.startswith("/pm"):
@@ -1528,17 +2220,27 @@ def handle_client(client_socket, client_address):
                 if not logged_in_user in bans and logged_in_user and user_server:
                     room_name, host_part = parse_room_and_host(user_server)
                     if host_part and host_part != MY_SERVER_HOST:
+                        _echo_room_event(session, client_key, 'message', logged_in_user, MY_SERVER_HOST, {'text': message})
                         payload = {
                             'type': 'room_message',
                             'room': room_name,
                             'sender': logged_in_user,
-                            'payload': {'text': message}
+                            'payload': {'text': message},
                         }
-                        send_remote_room_message(host_part, room_name, payload)
+                        _send_remote_room_async(host_part, room_name, payload)
                     else:
                         full_message = f"{logged_in_user}: {message}"
-                        broadcast_message(full_message, user_server, message_type='chat_message', sender=logged_in_user)
-                        _send_room_event_to_remotes(room_name, 'message', logged_in_user, MY_SERVER_HOST, {'text': message})
+                        broadcast_message(
+                            full_message,
+                            user_server,
+                            message_type='chat_message',
+                            sender=logged_in_user,
+                        )
+                        threading.Thread(
+                            target=_send_room_event_to_remotes,
+                            args=(room_name, 'message', logged_in_user, MY_SERVER_HOST, {'text': message}),
+                            daemon=True,
+                        ).start()
     except Exception as e:
         log_message(f"TCP client {client_address} error: {e}.")
 
@@ -1565,19 +2267,23 @@ def handle_client(client_socket, client_address):
                         server_sessions.remove(s)
 
                     if '@' not in s.server_name:
-                        still_has = any(sess.username == s.username for sess in server_sessions)
-                        if not still_has:
-                            members = servers.get(s.server_name, [])
-                            if s.username in members:
-                                members.remove(s.username)
-                                servers[s.server_name] = members
-                                save_server(s.server_name, members)
-
-                            left_broadcast_needed = (s.username, s.server_name)
-                            last = _authoritative_room_remove_member(s.server_name, s.username, MY_SERVER_HOST)
+                        if s.username:
+                            last = _authoritative_room_remove_member(
+                                s.server_name, s.username, MY_SERVER_HOST,
+                            )
                             if last:
+                                members = servers.get(s.server_name, [])
+                                if s.username in members:
+                                    members.remove(s.username)
+                                    servers[s.server_name] = members
+                                    save_server(s.server_name, members)
+                                left_broadcast_needed = (s.username, s.server_name)
                                 try:
-                                    threading.Thread(target=_send_room_event_to_remotes, args=(s.server_name, 'left', s.username, MY_SERVER_HOST, None), daemon=True).start()
+                                    threading.Thread(
+                                        target=_send_room_event_to_remotes,
+                                        args=(s.server_name, 'left', s.username, MY_SERVER_HOST, None),
+                                        daemon=True,
+                                    ).start()
                                 except Exception:
                                     pass
                     else:
@@ -1652,6 +2358,10 @@ def start_tcp_server(host='0.0.0.0', port=TCP_PORT):
                 except Exception:
                     pass
 
+                if peek.startswith(S2S_MAGIC):
+                    s2s_link.handle_inbound(sock, _s2s_inbound_encrypted)
+                    return
+
                 handle_client(sock, addr)
             except Exception:
                 try:
@@ -1671,27 +2381,10 @@ def handle_dialback_check(msg_data):
         'result': 'ok'
     }
 
-def _send_remote_room_sync(target_host, target_port, data):
+def _send_remote_room_sync(target_host, data):
     def _send_room_msg():
-        try:
-            with socket.create_connection((target_host, target_port), timeout=5) as s:
-                s.sendall((json.dumps(data) + '\n').encode('utf-8'))
-                s.settimeout(5)
-                response = b''
-                while not response.endswith(b'\n'):
-                    chunk = s.recv(MAX_PACKET_SIZE)
-                    if not chunk:
-                        break
-                    response += chunk
-                if response:
-                    try:
-                        return json.loads(response.decode('utf-8').strip())
-                    except Exception:
-                        return None
-                return None
-        except Exception:
-            raise
-    
+        return s2s_link.send_json(target_host, data)
+
     return send_with_retry(_send_room_msg)
 
 def _kick_user(identifier):
