@@ -67,8 +67,8 @@ def save_bans(bans):
 
 # Change this!
 MY_SERVER_HOST = "example.com"
-TCP_PORT = 42439
-ENCRYPTED_PORT = 42440
+TCP_PORT = 42443
+ENCRYPTED_PORT = 42444
 ADMIN_USERNAME = "ADMIN"
 
 IV_SIZE = 16
@@ -149,8 +149,7 @@ def stream_ready(sock, timeout):
 
 def filter_stream(sock, data, stream=None):
     if stream is not None and CTRL_ESC in data:
-        stream.telnet = True
-        stream.plain_candidate = False
+        stream.mark_telnet()
     out = bytearray()
     i = 0
     n = len(data)
@@ -220,10 +219,30 @@ class TextStream:
         self.plain_candidate = True
         self.first_line = True
         self.break_next = False
+        self.cursor = 0
 
     @property
     def interactive(self):
         return self.mode == 'interactive'
+
+    def mark_telnet(self):
+        self.telnet = True
+        self.plain_candidate = False
+        if self.encoding == 'utf-8' or not self.encoding_set:
+            self.encoding = 'cp866'
+            self.encoding_set = False
+
+    def outbound_encoding(self):
+        if self.mode == 'plain':
+            return 'utf-8'
+        if self.mode == 'interactive':
+            if self.encoding in STREAM_ENCODINGS:
+                return self.encoding
+            return 'cp866'
+        return 'utf-8'
+
+    def _uses_console_encoding(self):
+        return self.telnet or self.mode == 'interactive'
 
     @staticmethod
     def looks_like_tcp_batch(chunk):
@@ -241,7 +260,11 @@ class TextStream:
     def looks_like_plain_line_protocol(chunk, telnet=False):
         if not chunk or telnet or CTRL_ESC in chunk:
             return False
-        if b'\n' not in chunk or b'\r' in chunk:
+        if b'\n' not in chunk:
+            return False
+        if b'\r\n' in chunk:
+            return True
+        if b'\r' in chunk:
             return False
         return True
 
@@ -279,6 +302,17 @@ class TextStream:
     def note_encoding(self, raw):
         if not any(b >= 0x80 for b in raw):
             return
+        if self._uses_console_encoding():
+            for enc in STREAM_ENCODINGS:
+                try:
+                    text = raw.decode(enc)
+                    if text.encode(enc) == raw:
+                        self.encoding = enc
+                        self.encoding_set = True
+                        return
+                except UnicodeDecodeError:
+                    continue
+            return
         if self.encoding_set:
             return
         try:
@@ -307,6 +341,73 @@ class TextStream:
             return raw.decode(self.encoding).strip()
         except UnicodeDecodeError:
             return raw.decode(self.encoding, errors='replace').strip()
+
+    def _delete_before_cursor(self):
+        if self.cursor <= 0 or not self.pending:
+            return False
+        if self.encoding != 'utf-8':
+            size = 1
+        else:
+            size = 1
+            for sz in range(1, min(5, self.cursor + 1)):
+                try:
+                    self.pending[self.cursor - sz:self.cursor].decode('utf-8')
+                    size = sz
+                    break
+                except UnicodeDecodeError:
+                    continue
+        self.pending = self.pending[:self.cursor - size] + self.pending[self.cursor:]
+        self.cursor -= size
+        return True
+
+    def _insert_byte(self, sock, b):
+        self.pending = self.pending[:self.cursor] + bytes([b]) + self.pending[self.cursor:]
+        self.cursor += 1
+        if not self.echo:
+            return
+        try:
+            after = self.pending[self.cursor:]
+            sock.send(bytes([b]))
+            if after:
+                sock.send(after)
+                sock.send(b'\x1b[' + str(len(after)).encode() + b'D')
+        except Exception:
+            pass
+
+    def _echo_backspace_at_cursor(self, sock):
+        try:
+            after = self.pending[self.cursor:]
+            sock.send(b'\x08 \x08')
+            if after:
+                sock.send(after)
+                sock.send(b' ')
+                sock.send(b'\x1b[' + str(len(after) + 1).encode() + b'D')
+        except Exception:
+            pass
+
+    def _handle_escape_sequence(self, sock, seq):
+        if not self.echo:
+            return
+        try:
+            if seq in (b'D', b'2D'):
+                if self.cursor > 0:
+                    self.cursor -= 1
+                    sock.send(b'\x1b[D')
+            elif seq in (b'C', b'2C'):
+                if self.cursor < len(self.pending):
+                    self.cursor += 1
+                    sock.send(b'\x1b[C')
+            elif seq in (b'H', b'1~', b'7~'):
+                if self.cursor > 0:
+                    sock.send(b'\x1b[' + str(self.cursor).encode() + b'D')
+                    self.cursor = 0
+            elif seq in (b'F', b'4~'):
+                move = len(self.pending) - self.cursor
+                if move > 0:
+                    sock.send(b'\x1b[' + str(move).encode() + b'C')
+                    self.cursor = len(self.pending)
+        except Exception:
+            pass
 
     def trim_last(self):
         if not self.pending:
@@ -338,16 +439,21 @@ class TextStream:
         while i < n:
             b = chunk[i]
             if b in BACKSPACE_KEYS:
-                if self.trim_last() and self.echo:
-                    self.erase_echo(sock)
+                if self._delete_before_cursor() and self.echo:
+                    self._echo_backspace_at_cursor(sock)
                 i += 1
                 continue
             if b == 27 and i + 1 < n and chunk[i + 1] == ord('['):
                 i += 2
+                param = bytearray()
                 while i < n and not (64 <= chunk[i] <= 126):
+                    param.append(chunk[i])
                     i += 1
                 if i < n:
+                    final = chunk[i]
                     i += 1
+                    seq = bytes(param) + bytes([final])
+                    self._handle_escape_sequence(sock, seq[1:] if seq[:1] == b'[' else seq)
                 continue
             if b in (13, 10):
                 self.pending += bytes([b])
@@ -356,12 +462,7 @@ class TextStream:
             if b < 32:
                 i += 1
                 continue
-            self.pending += bytes([b])
-            if self.echo:
-                try:
-                    sock.send(bytes([b]))
-                except Exception:
-                    pass
+            self._insert_byte(sock, b)
             i += 1
 
     def pop_line(self):
@@ -372,6 +473,7 @@ class TextStream:
                 self.pending = self.pending[idx + len(sep):]
                 if self.pending.startswith(b'\n') and sep == b'\r':
                     self.pending = self.pending[1:]
+                self.cursor = 0
                 text = self.decode_bytes(line)
                 return text if text else ''
         return None
@@ -381,6 +483,7 @@ class TextStream:
             return None
         text = self.decode_bytes(self.pending)
         self.pending = b''
+        self.cursor = 0
         return text if text else None
 
     def _strip_keepalive_prefix(self, data):
@@ -388,14 +491,6 @@ class TextStream:
             return data
         if data.startswith(b'//'):
             return data[1:]
-        if len(data) > 1 and data[:1] == b'/':
-            rest = data[1:]
-            cmd_prefixes = (
-                b'login', b'register', b'join', b'pm ', b'act ', b'help', b'members',
-                b'create', b'list_', b'ban', b'delete',
-            )
-            if not any(rest.startswith(p) for p in cmd_prefixes):
-                return rest
         return data
 
     def read_plain(self, sock, first_chunk=None):
@@ -468,15 +563,14 @@ def plain_send(sock, message, line_break=False):
     sess = socket_to_session.get(sock)
     stream = sess.text_in if sess and getattr(sess, 'text_in', None) else None
 
-    if stream and stream.interactive:
-        out = plain_text_out(message, stream.encoding)
-        if stream.echo and (line_break or stream.break_next):
-            out = b'\r\n' + out
-            stream.break_next = False
+    if stream:
+        enc = stream.outbound_encoding()
     else:
-        if not message.endswith('\n'):
-            message = message.rstrip('\r\n') + '\n'
-        out = message.encode('utf-8')
+        enc = 'utf-8'
+    out = plain_text_out(message, enc)
+    if stream and stream.interactive and stream.echo and (line_break or stream.break_next):
+        out = b'\r\n' + out
+        stream.break_next = False
 
     sock.send(out)
 
@@ -1663,6 +1757,20 @@ def get_safe_server_path(server_name):
 def is_ping(text):
     return bool(text) and all(ch == '/' for ch in text)
 
+def is_at_command(text):
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) < 2 or t[:3].upper() != 'AT ':
+        return False
+    rest = t[2:]
+    if rest and rest[0] in ' &':
+        rest = rest[1:].lstrip()
+    if not rest:
+        return True
+    allowed = set('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789=,;.+*- ')
+    return all(ch.upper() in allowed for ch in rest)
+
 def get_client_encryption_key(session):
     if not hasattr(session, 'client_socket') or not session.client_socket:
         return None
@@ -1797,7 +1905,16 @@ def receive_from_client(client_socket, client_key=None, text_in=None):
         else:
             if text_in is None:
                 text_in = TextStream()
-            return text_in.read(client_socket)
+            while True:
+                line = text_in.read(client_socket)
+                if line is None:
+                    return None
+                if line == '':
+                    return ''
+                if is_at_command(line):
+                    text_in.mark_telnet()
+                    continue
+                return line
     except Exception as e:
         log_message(f"Error receiving from client: {e}.")
         return None
@@ -1842,8 +1959,7 @@ def handle_client(client_socket, client_address):
                 except Exception:
                     if not use_encryption and text_in and peek:
                         if CTRL_ESC in peek:
-                            text_in.telnet = True
-                            text_in.plain_candidate = False
+                            text_in.mark_telnet()
                         elif TextStream.looks_like_plain_line_protocol(peek):
                             text_in.mode = 'plain'
                             text_in.encoding = 'utf-8'
@@ -1857,18 +1973,42 @@ def handle_client(client_socket, client_address):
 
         client_socket.settimeout(None)
 
+        stashed_command = None
+        if not use_encryption and text_in:
+            client_socket.settimeout(0.15)
+            drain_end = time.time() + 2.0
+            while time.time() < drain_end:
+                try:
+                    line = text_in.read(client_socket)
+                except Exception:
+                    break
+                if line is None:
+                    break
+                if line == '':
+                    continue
+                if is_at_command(line):
+                    text_in.mark_telnet()
+                    continue
+                stashed_command = line
+                break
+            client_socket.settimeout(None)
+
+        send_to_client(client_socket, "Enter command (/login /register): ", client_key)
+
         while not logged_in_user:
-            if not is_ping(last_cmd):
-                send_to_client(client_socket, "Enter command (/login /register): ", client_key)
-            else:
-                send_to_client(client_socket, "*Ping!*", client_key)
+            command = stashed_command if stashed_command is not None else receive_from_client(
+                client_socket, client_key, text_in
+            )
+            stashed_command = None
 
-            command = receive_from_client(client_socket, client_key, text_in)
-
-            if not command:
+            if command is None or command == '':
                 break
 
             last_cmd = command
+
+            if is_ping(command):
+                send_to_client(client_socket, "*Ping!*", client_key)
+                continue
 
             if not is_ping(command):
                 log_message(f"TCP {client_address} message: {command}")
@@ -1912,6 +2052,9 @@ def handle_client(client_socket, client_address):
                 else:
                     send_to_client(client_socket, "Invalid username or password.", client_key)
 
+            if not logged_in_user:
+                send_to_client(client_socket, "Enter command (/login /register): ", client_key)
+
     except (ConnectionResetError, BrokenPipeError):
         log_message(f"TCP client {client_address} disconnected unexpectedly.")
         client_socket.close()
@@ -1922,8 +2065,12 @@ def handle_client(client_socket, client_address):
         while True:
             message = receive_from_client(client_socket, client_key, text_in)
 
-            if not message:
+            if message is None or message == '':
                 break
+
+            if is_ping(message):
+                send_to_client(client_socket, "*Ping!*", client_key)
+                continue
 
             if not is_ping(message):
                 log_message(f"TCP {client_address} message: {message}")
@@ -2211,8 +2358,6 @@ def handle_client(client_socket, client_address):
                         pass
                     else:
                         send_to_client(client_socket, "Unknown command.", client_key)
-                elif is_ping(message):
-                    send_to_client(client_socket, "*Ping!*", client_key)
                 else:
                     send_to_client(client_socket, "Unknown command.", client_key)
                         
