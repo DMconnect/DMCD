@@ -67,8 +67,8 @@ def save_bans(bans):
 
 # Change this!
 MY_SERVER_HOST = "example.com"
-TCP_PORT = 42443
-ENCRYPTED_PORT = 42444
+TCP_PORT = 42439
+ENCRYPTED_PORT = 42440
 ADMIN_USERNAME = "ADMIN"
 
 IV_SIZE = 16
