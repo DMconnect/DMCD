@@ -76,37 +76,73 @@ def _save_remote_subs():
     except Exception:
         pass
 
-def _send_s2s(host, payload):
+def _send_s2s(host, payload, wait_response=True):
     DMCD = _dmcd_module()
 
-    if DMCD is None:
+    if DMCD is None or not host:
         return None
 
     try:
         out = dict(payload or {})
-
-        out.setdefault('from_host', getattr(DMCD, 'MY_SERVER_HOST', '') or DMCD.get_advertised_host())
+        my_host = getattr(DMCD, 'MY_SERVER_HOST', '') or DMCD.get_advertised_host()
+        out.setdefault('from_host', my_host)
         out.setdefault('msg_id', DMCD.generate_msg_id(out.get('type', 'presence'), host, str(time.time())))
-        resp = DMCD._send_remote_room_sync(host, out)
-        return resp
-
+        return DMCD.s2s_link.send_json(host, out, wait_response=wait_response)
     except Exception:
         return None
+
+
+def _user_exists_locally(username):
+    if not username:
+        return False
+    DMCD = _dmcd_module()
+    if DMCD is None:
+        return False
+    try:
+        return username in getattr(DMCD, 'users', {})
+    except Exception:
+        return False
+
+
+def _user_is_online_locally(username):
+    DMCD = _dmcd_module()
+    if DMCD is None:
+        return False
+    try:
+        with DMCD.session_lock:
+            return bool(DMCD.clients_by_user.get(username, set()))
+    except Exception:
+        return False
+
+
+def collect_remote_status_targets():
+    _load_subscriptions()
+    by_host = {}
+    with _state_lock:
+        for targets in (_subscriptions or {}).values():
+            for t in targets:
+                if '@' not in t:
+                    continue
+                user_part, host_part = t.rsplit('@', 1)
+                if user_part and host_part:
+                    by_host.setdefault(host_part, set()).add(user_part)
+    return by_host
 
 def handle_presence_subscribe(from_host, subscriber_user, target_local_user):
     _load_remote_subs()
 
     if not from_host or not subscriber_user or not target_local_user:
-        return False
+        return False, 'bad_request'
+    if not _user_exists_locally(target_local_user):
+        return False, 'user_not_found'
 
     with _state_lock:
         by_host = _remote_subs.setdefault(target_local_user, {})
         users = by_host.setdefault(from_host, set())
         users.add(subscriber_user)
-        
-    _save_remote_subs()
 
-    return True
+    _save_remote_subs()
+    return True, 'ok'
 
 def handle_presence_unsubscribe(from_host, subscriber_user, target_local_user):
     _load_remote_subs()
@@ -283,13 +319,8 @@ def notify_status_change(target_identifier, online):
 
     with _state_lock:
         prev = _last_state.get(key)
-
-        if prev is None:
-            _last_state[key] = now
-
         if prev == now:
             return
-
         _last_state[key] = now
         subs_snapshot = {k: set(v) for k, v in (_subscriptions or {}).items()}
 
@@ -330,11 +361,16 @@ def notify_status_change(target_identifier, online):
             return
 
         with _state_lock:
-            by_host = dict(_remote_subs.get(key, {}))
+            by_host = dict((_remote_subs.get(key) or {}).items())
 
         for host in by_host.keys():
             if host:
-                _send_s2s(host, {'type': 'presence_update', 'user': key, 'online': now})
+                threading.Thread(
+                    target=_send_s2s,
+                    args=(host, {'type': 'presence_update', 'user': key, 'online': now}),
+                    kwargs={'wait_response': False},
+                    daemon=True,
+                ).start()
 
     except Exception:
         pass
@@ -419,34 +455,43 @@ class StatusCapability(Capability):
             self.send_message("Usage: /status-sub-add <username>", client_socket, client_key)
             return True
 
-        ok, msg = sub_add(session.username, args[0])
+        t = _normalize_target(args[0])
+        if not t:
+            self.send_message("Invalid username.", client_socket, client_key)
+            return True
+
+        if '@' in t:
+            user_part, host_part = t.rsplit('@', 1)
+            ok, msg = sub_add(session.username, t)
+            if not ok:
+                self.send_message(msg, client_socket, client_key)
+                return True
+
+            resp = _send_s2s(host_part, {
+                'type': 'presence_subscribe',
+                'subscriber': session.username,
+                'target': user_part,
+            })
+            if isinstance(resp, dict) and resp.get('status') == 'ok':
+                self.send_message(msg, client_socket, client_key)
+                return True
+
+            reason = resp.get('reason') if isinstance(resp, dict) else None
+            if reason == 'user_not_found':
+                sub_del(session.username, t)
+                self.send_message("User does not exist.", client_socket, client_key)
+                return True
+
+            self.send_message(msg, client_socket, client_key)
+            return True
+
+        dmcd = _dmcd_module()
+        if dmcd is None or t not in getattr(dmcd, 'users', {}):
+            self.send_message("User does not exist.", client_socket, client_key)
+            return True
+
+        ok, msg = sub_add(session.username, t)
         self.send_message(msg, client_socket, client_key)
-
-        try:
-            t = _normalize_target(args[0])
-
-            if t and '@' in t:
-                user_part, host_part = t.rsplit('@', 1)
-                dmcd = _dmcd_module()
-                my_host = getattr(dmcd, 'MY_SERVER_HOST', None) if dmcd else None
-
-                if host_part and my_host and host_part != my_host:
-
-                    resp = _send_s2s(host_part, {
-                        'type': 'presence_subscribe',
-                        'subscriber': session.username,
-                        'target': user_part
-                    })
-
-                    if not isinstance(resp, dict):
-                        self.send_message("User does not exist.", client_socket, client_key)
-                        
-                    elif resp.get('status') != 'ok':
-                        self.send_message(f"User does not exist.", client_socket, client_key)
-
-        except Exception:
-            pass
-
         return True
 
     def handle_sub_del(self, args, session, client_socket, client_key, server_context=None):
@@ -470,17 +515,11 @@ class StatusCapability(Capability):
                 my_host = getattr(dmcd, 'MY_SERVER_HOST', None) if dmcd else None
 
                 if host_part and my_host and host_part != my_host:
-                    resp = _send_s2s(host_part, {
+                    _send_s2s(host_part, {
                         'type': 'presence_unsubscribe',
                         'subscriber': session.username,
                         'target': user_part
-                    })
-
-                    if not isinstance(resp, dict):
-                        self.send_message("Remote unsubscribe: no response.", client_socket, client_key)
-
-                    elif resp.get('status') != 'ok':
-                        self.send_message(f"Remote unsubscribe failed: {resp}", client_socket, client_key)
+                    }, wait_response=False)
         except Exception:
             pass
         return True

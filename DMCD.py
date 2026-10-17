@@ -147,9 +147,24 @@ def stream_ready(sock, timeout):
         return False
 
 
+def _telnet_send(sock, payload):
+    try:
+        sock.send(payload)
+    except Exception:
+        pass
+
+
+def _offer_telnet_binary(sock, stream):
+    if stream is None or getattr(stream, '_binary_offered', False):
+        return
+    stream._binary_offered = True
+    _telnet_send(sock, bytes([255, 251, 0, 255, 253, 0]))
+
+
 def filter_stream(sock, data, stream=None):
     if stream is not None and CTRL_ESC in data:
         stream.mark_telnet()
+        _offer_telnet_binary(sock, stream)
     out = bytearray()
     i = 0
     n = len(data)
@@ -167,32 +182,24 @@ def filter_stream(sock, data, stream=None):
             i += 2
         elif cmd == 253 and i + 2 < n:
             opt = data[i + 2]
-            if opt == 1:
-                try:
-                    sock.send(bytes([255, 251, 1]))
-                except Exception:
-                    pass
+            if opt == 0:
+                _telnet_send(sock, bytes([255, 251, 0]))
+            elif opt == 1:
+                _telnet_send(sock, bytes([255, 251, 1]))
                 if stream is not None:
                     stream.echo = True
                     stream.plain_candidate = False
             elif opt == 3:
-                try:
-                    sock.send(bytes([255, 251, 3]))
-                except Exception:
-                    pass
+                _telnet_send(sock, bytes([255, 251, 3]))
             elif opt == 24:
-                try:
-                    sock.send(bytes([255, 252, 24]))
-                except Exception:
-                    pass
+                _telnet_send(sock, bytes([255, 252, 24]))
             i += 3
         elif cmd == 251 and i + 2 < n:
             opt = data[i + 2]
-            if opt == 3:
-                try:
-                    sock.send(bytes([255, 253, 3]))
-                except Exception:
-                    pass
+            if opt == 0:
+                _telnet_send(sock, bytes([255, 253, 0]))
+            elif opt == 3:
+                _telnet_send(sock, bytes([255, 253, 3]))
             i += 3
         elif cmd in OPT_CMDS:
             i += 3 if i + 2 < n else n
@@ -228,12 +235,11 @@ class TextStream:
     def mark_telnet(self):
         self.telnet = True
         self.plain_candidate = False
-        if self.encoding == 'utf-8' or not self.encoding_set:
+        if not self.encoding_set:
             self.encoding = 'cp866'
-            self.encoding_set = False
 
     def outbound_encoding(self):
-        if self.mode == 'plain':
+        if self.mode == 'plain' or self.encoding == 'utf-8':
             return 'utf-8'
         if self.mode == 'interactive':
             if self.encoding in STREAM_ENCODINGS:
@@ -302,7 +308,17 @@ class TextStream:
     def note_encoding(self, raw):
         if not any(b >= 0x80 for b in raw):
             return
-        if self._uses_console_encoding():
+        try:
+            text = raw.decode('utf-8')
+            if text.encode('utf-8') == raw and len(text) < len(raw):
+                self.encoding = 'utf-8'
+                self.encoding_set = True
+                return
+        except UnicodeDecodeError:
+            pass
+        if self.encoding == 'utf-8' and self.encoding_set:
+            return
+        if self._uses_console_encoding() or not self.encoding_set:
             for enc in STREAM_ENCODINGS:
                 try:
                     text = raw.decode(enc)
@@ -312,26 +328,8 @@ class TextStream:
                         return
                 except UnicodeDecodeError:
                     continue
-            return
-        if self.encoding_set:
-            return
-        try:
-            text = raw.decode('utf-8')
-            if text.encode('utf-8') == raw:
-                self.encoding = 'utf-8'
-                self.encoding_set = True
-                return
-        except UnicodeDecodeError:
-            pass
-        for enc in STREAM_ENCODINGS:
-            try:
-                raw.decode(enc)
-                self.encoding = enc
-                self.encoding_set = True
-                return
-            except UnicodeDecodeError:
-                continue
-        self.encoding_set = True
+        if not self.encoding_set:
+            self.encoding_set = True
 
     def decode_bytes(self, raw):
         if not raw:
@@ -460,6 +458,8 @@ class TextStream:
                 i += 1
                 continue
             if b < 32:
+                if self.pending and self.pending[-1] >= 0xC0:
+                    self._insert_byte(sock, b | 0x80)
                 i += 1
                 continue
             self._insert_byte(sock, b)
@@ -1279,6 +1279,10 @@ def _process_s2s_message(msg, reply, sock, client_address):
 
         def async_presence_dialback_check():
             try:
+                if not from_host:
+                    reply({'status': 'error', 'reason': 'bad_request'})
+                    _s2s_close(sock)
+                    return
                 dialback_ok = send_dialback_check(from_host, msg_id, msg_type)
                 if not dialback_ok:
                     reply({'status': 'error', 'reason': 'Dialback failed'})
@@ -1287,13 +1291,21 @@ def _process_s2s_message(msg, reply, sock, client_address):
                 try:
                     from caps import status as status_cap
                     if msg_type == 'presence_subscribe':
-                        status_cap.handle_presence_subscribe(from_host, msg.get('subscriber'), msg.get('target'))
+                        ok, reason = status_cap.handle_presence_subscribe(
+                            from_host, msg.get('subscriber'), msg.get('target')
+                        )
+                        if not ok:
+                            reply({'status': 'error', 'reason': reason or 'failed'})
+                            _s2s_close(sock)
+                            return
                     elif msg_type == 'presence_unsubscribe':
                         status_cap.handle_presence_unsubscribe(from_host, msg.get('subscriber'), msg.get('target'))
                     elif msg_type == 'presence_update':
                         status_cap.handle_presence_update(from_host, msg.get('user'), msg.get('online'))
                 except Exception:
-                    pass
+                    reply({'status': 'error', 'reason': 'Internal error'})
+                    _s2s_close(sock)
+                    return
                 reply({'status': 'ok'})
                 _s2s_close(sock)
             except Exception:
@@ -2657,6 +2669,15 @@ def cleanup_tasks():
                 status_cap.notify_status_change(ident, online)
                 if not online:
                     _kick_user(ident)
+
+        try:
+            for host, usernames in status_cap.collect_remote_status_targets().items():
+                online_map = _check_remote_users_online(host, usernames)
+                for username in usernames:
+                    ident = f"{username}@{host}"
+                    status_cap.notify_status_change(ident, bool(online_map.get(username, False)))
+        except Exception:
+            pass
 
         cleanup_OU()
 
